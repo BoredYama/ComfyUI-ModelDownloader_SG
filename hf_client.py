@@ -3,6 +3,7 @@ import re
 import urllib.request
 import urllib.parse
 import urllib.error
+import concurrent.futures
 from config_manager import config_manager
 
 HF_API_BASE = "https://huggingface.co/api"
@@ -52,6 +53,68 @@ class HuggingFaceClient:
                 "url": resolve_url,
                 "error": str(e)
             }
+
+    def _parse_repo_detail(self, repo_detail, raw_query, clean_query, results):
+        repo_id = repo_detail.get("id")
+        if not repo_id:
+            return
+            
+        siblings = repo_detail.get("siblings", [])
+        is_gated = repo_detail.get("gated", False)
+        downloads = repo_detail.get("downloads", 0)
+        likes = repo_detail.get("likes", 0)
+        target_filename_lower = raw_query.lower()
+
+        for sib in siblings:
+            rfilename = sib.get("rfilename", "")
+            if not rfilename:
+                continue
+
+            # Filter for model extensions
+            if not any(rfilename.lower().endswith(ext) for ext in MODEL_EXTENSIONS):
+                continue
+
+            base_sibling_name = rfilename.split("/")[-1]
+            base_sibling_lower = base_sibling_name.lower()
+
+            # Check match relevance
+            is_exact_match = (base_sibling_lower == target_filename_lower)
+            is_partial_match = (
+                clean_query.lower() in base_sibling_lower or 
+                base_sibling_lower in target_filename_lower
+            )
+
+            if is_exact_match or is_partial_match:
+                resolve_url = f"https://huggingface.co/{repo_id}/resolve/main/{urllib.parse.quote(rfilename)}"
+                
+                # Deduplicate
+                if any(r["download_url"] == resolve_url for r in results):
+                    continue
+
+                # Calculate match score (higher is better)
+                score = 0
+                if is_exact_match:
+                    score += 100
+                if clean_query.lower() in base_sibling_lower:
+                    score += 20
+                if downloads:
+                    score += min(downloads // 1000, 30)
+                if likes:
+                    score += min(likes, 20)
+
+                results.append({
+                    "source": "huggingface",
+                    "name": base_sibling_name,
+                    "relative_path": rfilename,
+                    "repo_id": repo_id,
+                    "download_url": resolve_url,
+                    "is_gated": bool(is_gated),
+                    "likes": likes,
+                    "downloads": downloads,
+                    "size_bytes": 0,
+                    "score": score,
+                    "exact_match": is_exact_match
+                })
 
     def search_for_model(self, search_query: str, limit: int = 15) -> list:
         """
@@ -112,73 +175,17 @@ class HuggingFaceClient:
                 pass
 
         # 2. For the top candidate repositories, fetch repo details to inspect siblings (files)
-        target_filename_lower = raw_query.lower()
-
-        # Check up to 8 candidate repos
         for repo_info in matched_repos[:8]:
             repo_id = repo_info.get("id")
             if not repo_id:
                 continue
-
             try:
                 detail_url = f"{HF_API_BASE}/models/{repo_id}"
                 req = urllib.request.Request(detail_url, headers=headers)
                 with urllib.request.urlopen(req, timeout=8) as resp:
                     repo_detail = json.loads(resp.read().decode("utf-8"))
-
-                siblings = repo_detail.get("siblings", [])
-                is_gated = repo_detail.get("gated", False)
-                downloads = repo_detail.get("downloads", 0)
-                likes = repo_detail.get("likes", 0)
-
-                for sib in siblings:
-                    rfilename = sib.get("rfilename", "")
-                    if not rfilename:
-                        continue
-
-                    # Filter for model extensions
-                    if not any(rfilename.lower().endswith(ext) for ext in MODEL_EXTENSIONS):
-                        continue
-
-                    base_sibling_name = rfilename.split("/")[-1]
-                    base_sibling_lower = base_sibling_name.lower()
-
-                    # Check match relevance
-                    is_exact_match = (base_sibling_lower == target_filename_lower)
-                    is_partial_match = (
-                        clean_query.lower() in base_sibling_lower or 
-                        base_sibling_lower in target_filename_lower
-                    )
-
-                    if is_exact_match or is_partial_match:
-                        resolve_url = f"https://huggingface.co/{repo_id}/resolve/main/{urllib.parse.quote(rfilename)}"
-                        
-                        # Calculate match score (higher is better)
-                        score = 0
-                        if is_exact_match:
-                            score += 100
-                        if clean_query.lower() in base_sibling_lower:
-                            score += 20
-                        if downloads:
-                            score += min(downloads // 1000, 30)
-                        if likes:
-                            score += min(likes, 20)
-
-                        results.append({
-                            "source": "huggingface",
-                            "name": base_sibling_name,
-                            "relative_path": rfilename,
-                            "repo_id": repo_id,
-                            "download_url": resolve_url,
-                            "is_gated": bool(is_gated),
-                            "likes": likes,
-                            "downloads": downloads,
-                            "size_bytes": 0,  # Will query on-demand or display as streamable
-                            "score": score,
-                            "exact_match": is_exact_match
-                        })
+                self._parse_repo_detail(repo_detail, raw_query, clean_query, results)
             except Exception as e:
-                # Repo might be gated, private, or 401
                 if "401" in str(e) or "403" in str(e):
                     results.append({
                         "source": "huggingface",
@@ -193,7 +200,37 @@ class HuggingFaceClient:
                         "score": 50,
                         "exact_match": False
                     })
-                continue
+
+        # 3. Fallback for ComfyUI orgs if no exact match is found and few results
+        if not any(r["exact_match"] for r in results) and len(results) < 8:
+            KNOWN_ORGS = [
+                "Comfy-Org", "Kijai", "city96", "lllyasviel", 
+                "black-forest-labs", "stabilityai", "mcmonkey", 
+                "RunDiffusion", "cocktailpeanut", "ByteDance",
+                "lightx2v"
+            ]
+            
+            def fetch_org(org):
+                url1 = f"{HF_API_BASE}/models?author={org}&search={urllib.parse.quote(primary_keyword)}&limit=3&full=true"
+                url2 = f"{HF_API_BASE}/models?author={org}&sort=downloads&limit=5&full=true"
+                repos = []
+                for url in [url1, url2]:
+                    try:
+                        req = urllib.request.Request(url, headers=headers)
+                        with urllib.request.urlopen(req, timeout=5) as resp:
+                            repos.extend(json.loads(resp.read().decode("utf-8")))
+                    except Exception:
+                        pass
+                return repos
+                    
+            org_repos = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                futures = [executor.submit(fetch_org, org) for org in KNOWN_ORGS]
+                for future in concurrent.futures.as_completed(futures):
+                    org_repos.extend(future.result())
+                    
+            for repo_detail in org_repos:
+                self._parse_repo_detail(repo_detail, raw_query, clean_query, results)
 
         # Sort results: exact matches first, then highest score
         results.sort(key=lambda x: (x.get("exact_match", False), x.get("score", 0)), reverse=True)
