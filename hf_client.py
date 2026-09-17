@@ -232,6 +232,18 @@ class HuggingFaceClient:
             for repo_detail in org_repos:
                 self._parse_repo_detail(repo_detail, raw_query, clean_query, results)
 
+        # 4. Concurrently fetch exact file sizes for Hugging Face results
+        def fetch_size(r):
+            if r.get("source") == "huggingface" and r.get("size_bytes", 0) == 0:
+                try:
+                    info = self.get_file_info(r["repo_id"], r["relative_path"])
+                    r["size_bytes"] = info.get("size_bytes", 0)
+                except Exception:
+                    pass
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            list(executor.map(fetch_size, results))
+
         # Sort results: exact matches first, then highest score
         results.sort(key=lambda x: (x.get("exact_match", False), x.get("score", 0)), reverse=True)
         return results
