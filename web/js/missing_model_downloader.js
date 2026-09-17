@@ -1,0 +1,884 @@
+import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
+
+// Load CSS — co-located in same WEB_DIRECTORY (web/js/) so it's always served
+const cssLink = document.createElement("link");
+cssLink.rel = "stylesheet";
+cssLink.type = "text/css";
+cssLink.href = new URL("style.css", import.meta.url).href;
+document.head.appendChild(cssLink);
+
+// Sorted folder list for dropdowns
+const SORTED_FOLDERS = [
+    "checkpoints", "clip", "clip_vision", "controlnet",
+    "diffusion_models", "embeddings", "loras",
+    "upscale_models", "vae"
+];
+
+class MissingModelDownloaderUI {
+    constructor() {
+        this.missingModels = [];
+        this.activeDownloads = {};
+        this.config = {
+            has_hf_token: false,
+            hf_token_masked: "",
+            has_civitai_token: false,
+            civitai_token_masked: "",
+            default_provider: "huggingface",
+            auto_detect_on_load: true
+        };
+        this.modal = null;
+        this.nativeBtn = null;
+        this.isScanning = false;
+    }
+
+    async init() {
+        await this.loadConfig();
+        this.createTopbarButton();
+        this.createModal();
+        this.setupWebSocketListeners();
+        this.setupWorkflowHooks();
+        this.setupKeyboardShortcut();
+
+        // Initial scan after UI is ready
+        setTimeout(() => this.scanWorkflow(false), 2000);
+    }
+
+    async loadConfig() {
+        try {
+            const resp = await api.fetchApi("/model_downloader/config");
+            if (resp.ok) {
+                this.config = await resp.json();
+            }
+        } catch (e) {
+            console.error("[ModelDownloader] Failed to load config:", e);
+        }
+    }
+
+    async createTopbarButton() {
+        // ComfyUI V2 Topbar Integration only — no floating button
+        try {
+            let ComfyBtn = null;
+            let ComfyBtnGroup = null;
+
+            if (window.comfyAPI) {
+                ComfyBtn = window.comfyAPI.button?.ComfyButton;
+                ComfyBtnGroup = window.comfyAPI.buttonGroup?.ComfyButtonGroup;
+            }
+
+            if (!ComfyBtn) {
+                try {
+                    const mod = await import("../../scripts/ui/components/button.js");
+                    ComfyBtn = mod.ComfyButton;
+                } catch (e) { /* Not available */ }
+            }
+            if (!ComfyBtnGroup) {
+                try {
+                    const mod = await import("../../scripts/ui/components/buttonGroup.js");
+                    ComfyBtnGroup = mod.ComfyButtonGroup;
+                } catch (e) { /* Not available */ }
+            }
+
+            if (ComfyBtn && ComfyBtnGroup) {
+                const nativeButton = new ComfyBtn({
+                    icon: "download",
+                    action: () => this.openModal(),
+                    tooltip: "Missing Model Downloader (Ctrl+Shift+M)",
+                    content: "Missing Models",
+                    classList: "comfyui-button comfyui-menu-mobile-collapse primary"
+                });
+                this.nativeBtn = nativeButton;
+                const group = new ComfyBtnGroup(nativeButton.element);
+
+                const mountNative = () => {
+                    if (app.menu?.settingsGroup?.element) {
+                        app.menu.settingsGroup.element.before(group.element);
+                        return true;
+                    } else if (app.menu?.actionsGroup?.element) {
+                        app.menu.actionsGroup.element.before(group.element);
+                        return true;
+                    }
+                    return false;
+                };
+
+                if (!mountNative()) {
+                    let attempts = 0;
+                    const poll = setInterval(() => {
+                        attempts++;
+                        if (mountNative() || attempts > 30) clearInterval(poll);
+                    }, 300);
+                }
+            }
+        } catch (e) {
+            console.warn("[ModelDownloader] ComfyButton integration error:", e);
+        }
+    }
+
+    setupKeyboardShortcut() {
+        window.addEventListener("keydown", (e) => {
+            const isCtrlShiftM = (e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === "m" || e.key === "M");
+            if (isCtrlShiftM) {
+                e.preventDefault();
+                e.stopPropagation();
+                if (this.modal && this.modal.classList.contains("active")) {
+                    this.closeModal();
+                } else {
+                    this.openModal();
+                }
+            }
+        }, true);
+    }
+
+    updateBadge(count) {
+        if (this.nativeBtn && this.nativeBtn.element) {
+            if (count > 0) {
+                this.nativeBtn.element.textContent = `Missing Models (${count})`;
+                this.nativeBtn.element.style.color = "#cd5c5c";
+            } else {
+                this.nativeBtn.element.textContent = "Missing Models";
+                this.nativeBtn.element.style.color = "";
+            }
+        }
+    }
+
+    setupWebSocketListeners() {
+        api.addEventListener("model_downloader_progress", (event) => {
+            const task = event.detail;
+            if (!task || !task.id) return;
+            this.activeDownloads[task.id] = task;
+            this.updateDownloadsTab();
+        });
+
+        api.addEventListener("model_downloader_completed", (event) => {
+            const task = event.detail;
+            if (task) {
+                this.showToast(`Downloaded: ${task.filename}`);
+                setTimeout(() => this.scanWorkflow(false), 500);
+            }
+        });
+    }
+
+    setupWorkflowHooks() {
+        const origLoadGraphData = app.loadGraphData;
+        if (origLoadGraphData) {
+            app.loadGraphData = (...args) => {
+                const res = origLoadGraphData.apply(app, args);
+                if (this.config.auto_detect_on_load) {
+                    setTimeout(() => this.scanWorkflow(true), 800);
+                }
+                return res;
+            };
+        }
+    }
+
+    async scanWorkflow(notifyUser = false) {
+        if (this.isScanning) return;
+        this.isScanning = true;
+
+        try {
+            const candidates = [];
+            if (app.graph && app.graph._nodes) {
+                for (const node of app.graph._nodes) {
+                    if (node.widgets) {
+                        for (const w of node.widgets) {
+                            if (w && typeof w.value === "string" && w.value.trim().length > 0) {
+                                const val = w.value.trim();
+                                const isModelExt = /\.(safetensors|gguf|ckpt|pt|bin|pth|onnx)$/i.test(val);
+                                const isModelWidget = /(ckpt|lora|vae|controlnet|unet|clip|model)/i.test(w.name || "");
+                                if (isModelExt || isModelWidget) {
+                                    candidates.push({
+                                        node_id: node.id,
+                                        node_type: node.type || node.title,
+                                        widget_name: w.name,
+                                        value: val
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let promptData = null;
+            try {
+                if (app.graphToPrompt) {
+                    const p = await app.graphToPrompt();
+                    promptData = p.output || p.prompt; // Support both just in case
+                }
+            } catch (err) {
+                console.warn("[ModelDownloader] Failed to get graphToPrompt:", err);
+            }
+            
+            let workflowData = null;
+            try {
+                if (app.graph) {
+                    workflowData = app.graph.serialize();
+                }
+            } catch (err) {
+                console.warn("[ModelDownloader] Failed to serialize graph:", err);
+            }
+
+            const resp = await api.fetchApi("/model_downloader/detect", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ candidates, prompt: promptData, workflow: workflowData })
+            });
+
+            if (resp.ok) {
+                const data = await resp.json();
+                this.missingModels = data.missing_models || [];
+                this.updateBadge(this.missingModels.length);
+                this.renderMissingModels();
+
+                if (notifyUser && this.missingModels.length > 0) {
+                    this.showBanner(`${this.missingModels.length} missing model(s) detected.`);
+                }
+            }
+        } catch (e) {
+            console.error("[ModelDownloader] Error scanning workflow:", e);
+        } finally {
+            this.isScanning = false;
+        }
+    }
+
+    /** Build sorted folder <option> HTML */
+    buildFolderOptions(folders, selectedFolder) {
+        const sorted = [...folders].sort((a, b) => a.localeCompare(b));
+        return sorted.map(f =>
+            `<option value="${f}" ${f === selectedFolder ? 'selected' : ''}>${f}</option>`
+        ).join("");
+    }
+
+    createModal() {
+        const folderOptionsHTML = this.buildFolderOptions(SORTED_FOLDERS, "checkpoints");
+
+        const backdrop = document.createElement("div");
+        backdrop.className = "mmd-modal-backdrop";
+        backdrop.id = "mmd-modal-backdrop";
+
+        backdrop.innerHTML = `
+            <div class="mmd-modal">
+                <div class="mmd-header">
+                    <div class="mmd-header-left">
+                        <div class="mmd-header-title">
+                            <span class="accent">Model Downloader</span>
+                        </div>
+                    </div>
+                    <button class="mmd-close-btn" id="mmd-close-btn">&times;</button>
+                </div>
+
+                <div class="mmd-tabs">
+                    <button class="mmd-tab active" data-tab="missing">Missing Models</button>
+                    <button class="mmd-tab" data-tab="downloads">Active Downloads</button>
+                    <button class="mmd-tab" data-tab="direct">Direct Download</button>
+                    <button class="mmd-tab" data-tab="settings">Settings</button>
+                </div>
+
+                <div class="mmd-body">
+                    <!-- Tab 1: Missing Models -->
+                    <div class="mmd-panel active" id="mmd-panel-missing">
+                        <div class="mmd-toolbar">
+                            <span style="font-size: 12px; color: var(--mmd-text-muted);">
+                                Models referenced in the workflow but not found locally.
+                            </span>
+                            <button class="mmd-btn mmd-btn-outline" id="mmd-rescan-btn">Rescan</button>
+                        </div>
+                        <div id="mmd-missing-list" style="display: flex; flex-direction: column; gap: 8px;"></div>
+                    </div>
+
+                    <!-- Tab 2: Active Downloads -->
+                    <div class="mmd-panel" id="mmd-panel-downloads">
+                        <div id="mmd-downloads-list" style="display: flex; flex-direction: column; gap: 8px;"></div>
+                    </div>
+
+                    <!-- Tab 3: Direct Download -->
+                    <div class="mmd-panel" id="mmd-panel-direct">
+                        <div class="mmd-card">
+                            <div class="mmd-form-group">
+                                <label class="mmd-form-label">URL</label>
+                                <input type="text" id="mmd-direct-url" class="mmd-input" 
+                                       placeholder="https://huggingface.co/org/model/blob/main/file.safetensors" />
+                                <span class="mmd-form-hint">Hugging Face or Civitai file URL.</span>
+                            </div>
+                            <div class="mmd-form-group">
+                                <label class="mmd-form-label">Target Folder</label>
+                                <select id="mmd-direct-folder" class="mmd-select">
+                                    ${folderOptionsHTML}
+                                </select>
+                            </div>
+                            <div class="mmd-form-group">
+                                <label class="mmd-form-label">Filename (optional)</label>
+                                <input type="text" id="mmd-direct-filename" class="mmd-input" placeholder="Auto-detected from URL" />
+                            </div>
+                            <button class="mmd-btn mmd-btn-primary" id="mmd-direct-start-btn" style="align-self: flex-start;">
+                                Download
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Tab 4: Settings -->
+                    <div class="mmd-panel" id="mmd-panel-settings">
+                        <div class="mmd-card">
+                            <h3 style="margin: 0 0 4px 0; font-size: 13px; font-weight: 600; color: var(--mmd-text-main);">API Tokens</h3>
+                            <div class="mmd-form-group">
+                                <label class="mmd-form-label">
+                                    <span>Hugging Face Token</span>
+                                    <span id="mmd-hf-status" style="font-size: 10px;"></span>
+                                </label>
+                                <div class="mmd-input-group">
+                                    <input type="password" id="mmd-hf-token" class="mmd-input" 
+                                           placeholder="hf_..." autocomplete="off" />
+                                    <button class="mmd-btn mmd-btn-outline" id="mmd-verify-hf-btn">Verify</button>
+                                </div>
+                                <span class="mmd-form-hint">
+                                    Required for gated models (FLUX, SD3). 
+                                    <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noreferrer">Get token</a>
+                                </span>
+                            </div>
+
+                            <div class="mmd-form-group">
+                                <label class="mmd-form-label">
+                                    <span>Civitai API Key</span>
+                                    <span id="mmd-civitai-status" style="font-size: 10px;"></span>
+                                </label>
+                                <div class="mmd-input-group">
+                                    <input type="password" id="mmd-civitai-token" class="mmd-input" 
+                                           placeholder="Civitai API Key" autocomplete="off" />
+                                    <button class="mmd-btn mmd-btn-outline" id="mmd-verify-civitai-btn">Verify</button>
+                                </div>
+                                <span class="mmd-form-hint">
+                                    For authenticated models.
+                                    <a href="https://civitai.com/user/account" target="_blank" rel="noreferrer">Get key</a>
+                                </span>
+                            </div>
+
+                            <div class="mmd-form-group">
+                                <label class="mmd-form-label">Default Provider</label>
+                                <select id="mmd-default-provider" class="mmd-select">
+                                    <option value="huggingface">Hugging Face</option>
+                                    <option value="civitai">Civitai</option>
+                                </select>
+                            </div>
+
+                            <div class="mmd-form-group" style="flex-direction: row; align-items: center; gap: 8px;">
+                                <input type="checkbox" id="mmd-auto-detect" style="cursor: pointer; accent-color: #888;" />
+                                <label for="mmd-auto-detect" style="font-size: 12px; color: var(--mmd-text-secondary); cursor: pointer;">
+                                    Auto-scan on workflow load
+                                </label>
+                            </div>
+
+                            <button class="mmd-btn mmd-btn-primary" id="mmd-save-settings-btn" style="align-self: flex-start;">
+                                Save Settings
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(backdrop);
+        this.modal = backdrop;
+
+        // Events
+        backdrop.querySelector("#mmd-close-btn").onclick = () => this.closeModal();
+        backdrop.onclick = (e) => {
+            if (e.target === backdrop) this.closeModal();
+        };
+
+        // Escape key to close
+        document.addEventListener("keydown", (e) => {
+            if (e.key === "Escape" && this.modal.classList.contains("active")) {
+                this.closeModal();
+            }
+        });
+
+        // Tab switching
+        const tabs = backdrop.querySelectorAll(".mmd-tab");
+        tabs.forEach(tab => {
+            tab.onclick = () => {
+                tabs.forEach(t => t.classList.remove("active"));
+                backdrop.querySelectorAll(".mmd-panel").forEach(p => p.classList.remove("active"));
+                tab.classList.add("active");
+                const targetPanel = backdrop.querySelector(`#mmd-panel-${tab.dataset.tab}`);
+                if (targetPanel) targetPanel.classList.add("active");
+                if (tab.dataset.tab === "downloads") this.fetchActiveDownloads();
+            };
+        });
+
+        backdrop.querySelector("#mmd-rescan-btn").onclick = () => this.scanWorkflow(true);
+        backdrop.querySelector("#mmd-direct-start-btn").onclick = () => this.handleDirectDownload();
+        backdrop.querySelector("#mmd-save-settings-btn").onclick = () => this.handleSaveSettings();
+        backdrop.querySelector("#mmd-verify-hf-btn").onclick = () => this.handleVerifyHfToken();
+        backdrop.querySelector("#mmd-verify-civitai-btn").onclick = () => this.handleVerifyCivitaiToken();
+    }
+
+    openModal() {
+        if (!this.modal) return;
+        this.modal.classList.add("active");
+        this.populateSettingsFields();
+        this.renderMissingModels();
+        this.fetchActiveDownloads();
+    }
+
+    closeModal() {
+        if (!this.modal) return;
+        this.modal.classList.remove("active");
+    }
+
+    populateSettingsFields() {
+        const hfInput = this.modal.querySelector("#mmd-hf-token");
+        const civitaiInput = this.modal.querySelector("#mmd-civitai-token");
+        const providerSelect = this.modal.querySelector("#mmd-default-provider");
+        const autoDetect = this.modal.querySelector("#mmd-auto-detect");
+
+        if (this.config.has_hf_token) {
+            hfInput.value = this.config.hf_token_masked || "hf_••••••••";
+            this.modal.querySelector("#mmd-hf-status").innerHTML = `<span style="color: var(--mmd-success);">Saved</span>`;
+        } else {
+            hfInput.value = "";
+            this.modal.querySelector("#mmd-hf-status").innerHTML = `<span style="color: var(--mmd-text-muted);">—</span>`;
+        }
+
+        if (this.config.has_civitai_token) {
+            civitaiInput.value = this.config.civitai_token_masked || "••••••••";
+            this.modal.querySelector("#mmd-civitai-status").innerHTML = `<span style="color: var(--mmd-success);">Saved</span>`;
+        } else {
+            civitaiInput.value = "";
+            this.modal.querySelector("#mmd-civitai-status").innerHTML = `<span style="color: var(--mmd-text-muted);">—</span>`;
+        }
+
+        providerSelect.value = this.config.default_provider || "huggingface";
+        autoDetect.checked = this.config.auto_detect_on_load !== false;
+    }
+
+    async handleVerifyHfToken() {
+        const tokenVal = this.modal.querySelector("#mmd-hf-token").value.trim();
+        const statusSpan = this.modal.querySelector("#mmd-hf-status");
+        statusSpan.innerHTML = `<span style="color: var(--mmd-text-muted);">Checking...</span>`;
+
+        try {
+            const resp = await api.fetchApi("/model_downloader/test_token", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ provider: "huggingface", token: tokenVal })
+            });
+            const data = await resp.json();
+            if (data.valid) {
+                statusSpan.innerHTML = `<span style="color: var(--mmd-success);">Valid · ${data.username}</span>`;
+            } else {
+                statusSpan.innerHTML = `<span style="color: var(--mmd-danger);">Invalid</span>`;
+            }
+        } catch (e) {
+            statusSpan.innerHTML = `<span style="color: var(--mmd-danger);">Error</span>`;
+        }
+    }
+
+    async handleVerifyCivitaiToken() {
+        const tokenVal = this.modal.querySelector("#mmd-civitai-token").value.trim();
+        const statusSpan = this.modal.querySelector("#mmd-civitai-status");
+        statusSpan.innerHTML = `<span style="color: var(--mmd-text-muted);">Checking...</span>`;
+
+        try {
+            const resp = await api.fetchApi("/model_downloader/test_token", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ provider: "civitai", token: tokenVal })
+            });
+            const data = await resp.json();
+            if (data.valid) {
+                statusSpan.innerHTML = `<span style="color: var(--mmd-success);">Valid</span>`;
+            } else {
+                statusSpan.innerHTML = `<span style="color: var(--mmd-danger);">Invalid</span>`;
+            }
+        } catch (e) {
+            statusSpan.innerHTML = `<span style="color: var(--mmd-danger);">Error</span>`;
+        }
+    }
+
+    async handleSaveSettings() {
+        const hfToken = this.modal.querySelector("#mmd-hf-token").value.trim();
+        const civitaiToken = this.modal.querySelector("#mmd-civitai-token").value.trim();
+        const defaultProvider = this.modal.querySelector("#mmd-default-provider").value;
+        const autoDetect = this.modal.querySelector("#mmd-auto-detect").checked;
+
+        const payload = {
+            default_provider: defaultProvider,
+            auto_detect_on_load: autoDetect
+        };
+
+        if (hfToken && !hfToken.includes("••••")) payload.hf_token = hfToken;
+        if (civitaiToken && !civitaiToken.includes("••••")) payload.civitai_token = civitaiToken;
+
+        try {
+            const resp = await api.fetchApi("/model_downloader/config", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload)
+            });
+            if (resp.ok) {
+                const res = await resp.json();
+                this.config = res.config;
+                this.populateSettingsFields();
+                this.showToast("Settings saved.");
+            } else {
+                this.showToast("Failed to save.", true);
+            }
+        } catch (e) {
+            this.showToast("Failed to save.", true);
+        }
+    }
+
+    renderMissingModels() {
+        const list = this.modal ? this.modal.querySelector("#mmd-missing-list") : null;
+        if (!list) return;
+
+        if (this.missingModels.length === 0) {
+            list.innerHTML = `
+                <div class="mmd-empty-state">
+                    <div class="icon">—</div>
+                    <div style="font-size: 13px; font-weight: 500; color: var(--mmd-text-secondary);">No missing models</div>
+                    <div style="font-size: 12px;">All referenced models were found locally.</div>
+                </div>
+            `;
+            return;
+        }
+
+        list.innerHTML = "";
+        this.missingModels.forEach((model, index) => {
+            const card = document.createElement("div");
+            card.className = "mmd-card";
+            card.id = `mmd-missing-card-${index}`;
+
+            const availableFolders = model.available_folders || SORTED_FOLDERS;
+            const folderOptions = this.buildFolderOptions(availableFolders, model.folder_type);
+
+            card.innerHTML = `
+                <div class="mmd-card-header">
+                    <div>
+                        <div class="mmd-model-title">${model.filename}</div>
+                        <div class="mmd-model-meta" style="margin-top: 4px;">
+                            <span class="mmd-tag mmd-tag-node">${model.node_type}</span>
+                            <span>${model.widget_name}</span>
+                        </div>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 6px;">
+                        <select class="mmd-select mmd-folder-select" style="min-width: 120px;">
+                            ${folderOptions}
+                        </select>
+                        <button class="mmd-btn mmd-btn-outline mmd-collapse-btn" style="display: none; padding: 4px 8px;" title="Toggle results">▼</button>
+                        <button class="mmd-btn mmd-btn-primary mmd-search-btn">Search</button>
+                    </div>
+                </div>
+                <div class="mmd-results-container" style="display: none;" id="mmd-results-${index}"></div>
+            `;
+
+            const searchBtn = card.querySelector(".mmd-search-btn");
+            const collapseBtn = card.querySelector(".mmd-collapse-btn");
+            const resultsContainer = card.querySelector(`#mmd-results-${index}`);
+            const folderSelect = card.querySelector(".mmd-folder-select");
+
+            collapseBtn.onclick = () => {
+                if (resultsContainer.style.display === "none") {
+                    resultsContainer.style.display = "flex";
+                    collapseBtn.textContent = "▼";
+                } else {
+                    resultsContainer.style.display = "none";
+                    collapseBtn.textContent = "▶";
+                }
+            };
+
+            searchBtn.onclick = () => this.searchModel(model.filename, folderSelect.value, resultsContainer, searchBtn, collapseBtn);
+
+            list.appendChild(card);
+        });
+    }
+
+    async searchModel(filename, folderType, container, btn, collapseBtn) {
+        btn.disabled = true;
+        btn.textContent = "Searching...";
+        collapseBtn.style.display = "none";
+        container.style.display = "flex";
+        container.innerHTML = `<div style="font-size: 11px; color: var(--mmd-text-muted);">Querying sources...</div>`;
+
+        try {
+            const resp = await api.fetchApi("/model_downloader/search", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ query: filename, provider: "all", limit: 10 })
+            });
+
+            if (!resp.ok) {
+                container.innerHTML = `<div style="color: var(--mmd-danger); font-size: 11px;">Search failed.</div>`;
+                return;
+            }
+
+            const data = await resp.json();
+            const results = data.results || [];
+
+            if (results.length === 0) {
+                container.innerHTML = `
+                    <div style="font-size: 11px; color: var(--mmd-text-muted); padding: 6px 0;">
+                        No results found. Try the Direct Download tab with a URL.
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = "";
+            results.forEach(res => {
+                const item = document.createElement("div");
+                item.className = "mmd-result-item";
+
+                const isHF = res.source === "huggingface";
+                const sourceBadge = `<span class="mmd-tag mmd-tag-hf">${isHF ? "HF" : "Civitai"}</span>`;
+
+                const exactBadge = res.exact_match
+                    ? `<span class="mmd-tag" style="background: var(--mmd-success-bg); color: var(--mmd-success);">Exact</span>`
+                    : "";
+
+                const sizeDisplay = res.size_bytes > 0
+                    ? `${(res.size_bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
+                    : "—";
+
+                const gatedBadge = res.is_gated
+                    ? `<span class="mmd-tag" style="background: var(--mmd-danger-bg); color: var(--mmd-danger);">Auth</span>`
+                    : "";
+
+                item.innerHTML = `
+                    <div class="mmd-result-info">
+                        <div style="display: flex; align-items: center; gap: 5px; flex-wrap: wrap;">
+                            ${sourceBadge}${exactBadge}${gatedBadge}
+                            <span class="mmd-result-name">${res.name || filename}</span>
+                        </div>
+                        <div class="mmd-result-details">
+                            <span>${res.repo_id || res.creator || res.model_name || "—"}</span>
+                            <span>· ${sizeDisplay}</span>
+                            ${res.downloads ? `<span>· ${res.downloads.toLocaleString()} dl</span>` : ""}
+                        </div>
+                    </div>
+                    <button class="mmd-btn mmd-btn-primary mmd-dl-btn">Download</button>
+                `;
+
+                item.querySelector(".mmd-dl-btn").onclick = () => {
+                    this.startDownload(res.download_url, filename, folderType);
+                };
+
+                container.appendChild(item);
+            });
+            
+            collapseBtn.style.display = "inline-block";
+            collapseBtn.textContent = "▼";
+
+        } catch (e) {
+            container.innerHTML = `<div style="color: var(--mmd-danger); font-size: 11px;">${e.message}</div>`;
+        } finally {
+            btn.disabled = false;
+            btn.textContent = "Search";
+        }
+    }
+
+    async startDownload(url, filename, folderType, targetDir = "") {
+        try {
+            const resp = await api.fetchApi("/model_downloader/start_download", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ url, filename, folder_type: folderType, target_dir: targetDir })
+            });
+
+            if (resp.ok) {
+                this.showToast(`Starting: ${filename}`);
+                const dlTab = this.modal.querySelector('.mmd-tab[data-tab="downloads"]');
+                if (dlTab) dlTab.click();
+            } else {
+                const err = await resp.json();
+                this.showToast(err.message || "Download failed.", true);
+            }
+        } catch (e) {
+            this.showToast(e.message, true);
+        }
+    }
+
+    async handleDirectDownload() {
+        const urlInput = this.modal.querySelector("#mmd-direct-url");
+        const folderSelect = this.modal.querySelector("#mmd-direct-folder");
+        const filenameInput = this.modal.querySelector("#mmd-direct-filename");
+
+        const url = urlInput.value.trim();
+        if (!url) { this.showToast("Enter a URL.", true); return; }
+
+        let filename = filenameInput.value.trim();
+        if (!filename) {
+            filename = url.split("?")[0].split("/").pop();
+            if (!filename || !filename.includes(".")) filename = "model.safetensors";
+        }
+
+        await this.startDownload(url, filename, folderSelect.value);
+        urlInput.value = "";
+    }
+
+    async fetchActiveDownloads() {
+        try {
+            const resp = await api.fetchApi("/model_downloader/downloads");
+            if (resp.ok) {
+                const data = await resp.json();
+                (data.downloads || []).forEach(task => {
+                    this.activeDownloads[task.id] = task;
+                });
+                this.updateDownloadsTab();
+            }
+        } catch (e) { /* silent */ }
+    }
+
+    updateDownloadsTab() {
+        const list = this.modal ? this.modal.querySelector("#mmd-downloads-list") : null;
+        if (!list) return;
+
+        const tasks = Object.values(this.activeDownloads);
+        if (tasks.length === 0) {
+            list.innerHTML = `
+                <div class="mmd-empty-state">
+                    <div class="icon">—</div>
+                    <div style="font-size: 13px; font-weight: 500; color: var(--mmd-text-secondary);">No downloads</div>
+                    <div style="font-size: 12px;">Progress will appear here.</div>
+                </div>
+            `;
+            return;
+        }
+
+        list.innerHTML = "";
+        tasks.slice().reverse().forEach(task => {
+            const card = document.createElement("div");
+            card.className = "mmd-card";
+
+            const isDone = task.status === "completed";
+            const isFailed = task.status === "failed";
+            const isCancelled = task.status === "cancelled";
+            const isDownloading = task.status === "downloading";
+
+            let statusText = "";
+            let statusColor = "var(--mmd-text-muted)";
+            if (isDone) { statusText = "Completed"; statusColor = "var(--mmd-success)"; }
+            else if (isFailed) { statusText = "Failed"; statusColor = "var(--mmd-danger)"; }
+            else if (isCancelled) { statusText = "Cancelled"; statusColor = "var(--mmd-text-muted)"; }
+            else { statusText = "Downloading"; statusColor = "var(--mmd-text-secondary)"; }
+
+            const dlMB = ((task.downloaded_bytes || 0) / (1024 * 1024)).toFixed(1);
+            const totalMB = task.total_bytes > 0 ? (task.total_bytes / (1024 * 1024)).toFixed(1) : "?";
+
+            let statsText = "";
+            if (isDownloading) {
+                const speed = task.speed_mb || 0;
+                const etaMin = Math.floor((task.eta_seconds || 0) / 60);
+                const etaSec = Math.floor((task.eta_seconds || 0) % 60);
+                statsText = `${speed} MB/s · ${dlMB}/${totalMB} MB (${task.percentage || 0}%) · ETA ${etaMin}m ${etaSec}s`;
+            } else if (isDone) {
+                statsText = `${dlMB} MB → ${task.folder_type}`;
+            } else if (isFailed) {
+                statsText = task.error || "Error";
+            }
+
+            card.innerHTML = `
+                <div class="mmd-card-header">
+                    <div>
+                        <div class="mmd-model-title">${task.filename}</div>
+                        <div class="mmd-model-meta" style="margin-top: 3px;">
+                            <span style="color: ${statusColor}; font-size: 10px; font-weight: 600; text-transform: uppercase;">${statusText}</span>
+                            <span class="mmd-tag mmd-tag-folder">${task.folder_type}</span>
+                        </div>
+                    </div>
+                    ${isDownloading ? `<button class="mmd-btn mmd-btn-danger mmd-cancel-btn">Cancel</button>` : ""}
+                </div>
+                <div class="mmd-progress-wrap">
+                    <div class="mmd-progress-bar" style="width: ${task.percentage || 0}%;"></div>
+                </div>
+                <div style="font-size: 11px; color: var(--mmd-text-muted);">${statsText}</div>
+            `;
+
+            if (isDownloading) {
+                card.querySelector(".mmd-cancel-btn").onclick = async () => {
+                    await api.fetchApi("/model_downloader/cancel_download", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ task_id: task.id })
+                    });
+                    this.showToast(`Cancelled: ${task.filename}`);
+                };
+            }
+
+            list.appendChild(card);
+        });
+    }
+
+    showBanner(msg) {
+        const existing = document.querySelector(".mmd-banner");
+        if (existing) existing.remove();
+
+        const banner = document.createElement("div");
+        banner.className = "mmd-banner";
+        banner.innerHTML = `
+            <span>${msg}</span>
+            <button class="mmd-btn mmd-btn-primary" style="padding: 3px 8px; font-size: 10px;" id="mmd-banner-btn">Resolve</button>
+            <button style="background: none; border: none; color: var(--mmd-text-muted); cursor: pointer; font-size: 14px;" id="mmd-banner-close">&times;</button>
+        `;
+
+        banner.querySelector("#mmd-banner-btn").onclick = () => { banner.remove(); this.openModal(); };
+        banner.querySelector("#mmd-banner-close").onclick = () => banner.remove();
+
+        document.body.appendChild(banner);
+        setTimeout(() => { if (banner.parentNode) banner.remove(); }, 6000);
+    }
+
+    showToast(msg, isError = false) {
+        const toast = document.createElement("div");
+        toast.style.cssText = `
+            position: fixed; bottom: 24px; left: 24px; z-index: 100001;
+            padding: 8px 14px; border-radius: 4px;
+            background: ${isError ? "rgba(205, 92, 92, 0.9)" : "rgba(50, 50, 52, 0.95)"};
+            color: ${isError ? "#fff" : "var(--mmd-text-main)"};
+            font-family: var(--mmd-font); font-size: 12px; font-weight: 500;
+            border: 1px solid ${isError ? "rgba(205, 92, 92, 0.3)" : "rgba(255,255,255,0.08)"};
+            box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+        `;
+        toast.textContent = msg;
+        document.body.appendChild(toast);
+        setTimeout(() => {
+            toast.style.opacity = "0";
+            toast.style.transition = "opacity 0.2s ease";
+            setTimeout(() => toast.remove(), 200);
+        }, 3000);
+    }
+}
+
+let mmdUIInstance = null;
+
+app.registerExtension({
+    name: "ComfyUI.MissingModelDownloader",
+    commands: [
+        {
+            id: "ComfyUI.ModelDownloader.Open",
+            label: "Open Model Downloader",
+            icon: "pi pi-download",
+            function: () => {
+                if (mmdUIInstance) mmdUIInstance.openModal();
+            }
+        }
+    ],
+    keybindings: [
+        {
+            commandId: "ComfyUI.ModelDownloader.Open",
+            combo: { ctrl: true, shift: true, key: "m" }
+        }
+    ],
+    async setup() {
+        mmdUIInstance = new MissingModelDownloaderUI();
+        window.mmdUI = mmdUIInstance;
+        await mmdUIInstance.init();
+    },
+    nodeCreated(node) {
+        if (node && (node.comfyClass === "ModelDownloaderNode" || node.type === "ModelDownloaderNode")) {
+            node.addWidget("button", "Open Model Downloader", null, () => {
+                if (mmdUIInstance) mmdUIInstance.openModal();
+            });
+        }
+    }
+});
