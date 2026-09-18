@@ -50,6 +50,10 @@ NODE_TYPE_TO_FOLDER = {
     "gligen": "gligen",
     "animatediff": "animatediff_models",
     "ipadapter": "ipadapter",
+    "moge": "geometry_estimation",
+    "depth": "depth",
+    "backgroundremoval": "rembg",
+    "birefnet": "inpaint",
 }
 
 MODEL_EXTENSIONS = (".safetensors", ".gguf", ".ckpt", ".pt", ".bin", ".pth", ".onnx")
@@ -307,6 +311,20 @@ class MissingModelDetector:
                         exists = True
                 except Exception:
                     pass
+
+            # NEW: If still not found, search ALL registered ComfyUI folders to prevent false positives
+            if not exists and HAS_FOLDER_PATHS:
+                for f_type in folder_paths.folder_names_and_paths.keys():
+                    if f_type == folder_type:
+                        continue
+                    try:
+                        f_list = folder_paths.get_filename_list(f_type)
+                        if filename in f_list or any(os.path.basename(ef.replace("\\", "/")).lower() == filename.lower() for ef in f_list):
+                            exists = True
+                            folder_type = f_type
+                            break
+                    except Exception:
+                        pass
 
             if not exists:
                 target_dir = self.get_target_directory(folder_type)
