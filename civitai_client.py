@@ -81,12 +81,10 @@ class CivitaiClient:
                 images = version.get("images", [])
                 thumbnail = images[0].get("url") if images else None
 
-                base_download_url = version.get("downloadUrl") or f"https://civitai.com/api/download/models/{version_id}"
-                if token:
-                    delim = "&" if "?" in base_download_url else "?"
-                    final_download_url = f"{base_download_url}{delim}token={token}"
-                else:
-                    final_download_url = base_download_url
+                # No token appended here: the downloader attaches it as an Authorization
+                # header at fetch time (downloader.py), so it never has to sit in a URL
+                # that gets echoed back to the client, logged, or stored in task history.
+                final_download_url = version.get("downloadUrl") or f"https://civitai.com/api/download/models/{version_id}"
 
                 # Check if specific files match
                 matched_file = None
@@ -141,13 +139,15 @@ class CivitaiClient:
         url = url.strip()
         token = config_manager.get_civitai_token()
 
+        # Note: download_url is intentionally returned WITHOUT a token query param.
+        # downloader.py attaches the token as an Authorization header at fetch time,
+        # so it never needs to sit in a URL that's echoed to the client or logged.
+
         # Direct download endpoint
         match_dl = re.search(r"/api/download/models/(\d+)", url)
         if match_dl:
             version_id = match_dl.group(1)
             dl_url = f"https://civitai.com/api/download/models/{version_id}"
-            if token:
-                dl_url += f"?token={token}"
             return {
                 "source": "civitai",
                 "valid": True,
@@ -161,8 +161,6 @@ class CivitaiClient:
         if match_model_version:
             version_id = match_model_version.group(2)
             dl_url = f"https://civitai.com/api/download/models/{version_id}"
-            if token:
-                dl_url += f"?token={token}"
             return {
                 "source": "civitai",
                 "valid": True,
@@ -175,11 +173,9 @@ class CivitaiClient:
         match_model = re.search(r"civitai\.com/models/(\d+)", url)
         if match_model:
             model_id = match_model.group(1)
-            # Query API to get primary version ID
+            # Query API to get primary version ID (token sent via header only)
             try:
                 api_url = f"{CIVITAI_API_BASE}/models/{model_id}"
-                if token:
-                    api_url += f"?token={token}"
                 req = urllib.request.Request(api_url, headers=self._get_headers(token))
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     info = json.loads(resp.read().decode("utf-8"))
@@ -190,9 +186,6 @@ class CivitaiClient:
                         files = prim_ver.get("files", [])
                         fname = files[0].get("name") if files else f"{info.get('name')}.safetensors"
                         dl_url = prim_ver.get("downloadUrl") or f"https://civitai.com/api/download/models/{v_id}"
-                        if token:
-                            delim = "&" if "?" in dl_url else "?"
-                            dl_url = f"{dl_url}{delim}token={token}"
                         return {
                             "source": "civitai",
                             "valid": True,

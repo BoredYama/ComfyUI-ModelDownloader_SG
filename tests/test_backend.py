@@ -22,7 +22,7 @@ from config_manager import config_manager
 from hf_client import hf_client
 from civitai_client import civitai_client
 from detector import detector
-from downloader import download_manager
+from downloader import download_manager, host_matches, redact_url_secrets
 
 def test_config_manager():
     print("--- Testing ConfigManager ---")
@@ -124,6 +124,72 @@ def test_detector_graph_scanning():
     assert types["vae"] == "test_vae_nonexistent_123.safetensors"
     print("✓ Model detection and folder inference passed flawlessly.")
 
+def test_host_matches_rejects_lookalike_domains():
+    print("\n--- Testing Exact-Host Token Matching (security) ---")
+    assert host_matches("huggingface.co", "huggingface.co") is True
+    assert host_matches("files.huggingface.co", "huggingface.co") is True
+    assert host_matches("huggingface.co.evil.com", "huggingface.co") is False, \
+        "Look-alike domain must NOT match — would leak the bearer token"
+    assert host_matches("nothuggingface.co", "huggingface.co") is False
+    assert host_matches("evil.com", "huggingface.co") is False
+    print("✓ host_matches correctly rejects look-alike / substring domains.")
+
+def test_redact_url_secrets():
+    print("\n--- Testing URL Token Redaction ---")
+    url = "https://civitai.com/api/download/models/123?type=Model&token=supersecrettoken"
+    redacted = redact_url_secrets(url)
+    assert "supersecrettoken" not in redacted, "Raw token must never be echoed back to the client"
+    assert "token=***" in redacted
+    assert "type=Model" in redacted, "Non-sensitive params must be preserved"
+    print(f"✓ Token redacted: {redacted}")
+
+def test_path_traversal_is_blocked():
+    print("\n--- Testing Path Traversal Protection ---")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # A "../../../evil.safetensors" filename must be normalized down to just
+        # "evil.safetensors" and stay inside temp_dir — never escape it.
+        task_id = download_manager.start_download(
+            url="https://huggingface.co/x/y/resolve/main/z.safetensors",
+            filename="../../../evil.safetensors",
+            target_dir=temp_dir,
+            folder_type="checkpoints"
+        )
+        task = download_manager.get_task(task_id)
+        assert task["filename"] == "evil.safetensors", f"Filename must be sanitized, got {task['filename']!r}"
+        assert task["target_path"].startswith(os.path.abspath(temp_dir)), \
+            f"Target path escaped temp_dir: {task['target_path']}"
+        download_manager.cancel_task(task_id)
+        print(f"✓ Traversal filename normalized and contained: {task['target_path']}")
+
+        try:
+            download_manager.start_download(
+                url="file:///etc/passwd",
+                filename="passwd.txt",
+                target_dir=temp_dir,
+                folder_type="checkpoints"
+            )
+            assert False, "Expected a ValueError for a non-http(s) scheme"
+        except ValueError as e:
+            print(f"✓ Non-http(s) scheme rejected: {e}")
+
+def test_overwrite_protection():
+    print("\n--- Testing Overwrite Protection ---")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        existing = os.path.join(temp_dir, "already_here.safetensors")
+        with open(existing, "w") as f:
+            f.write("existing content")
+
+        try:
+            download_manager.start_download(
+                url="https://huggingface.co/x/y/resolve/main/already_here.safetensors",
+                filename="already_here.safetensors",
+                target_dir=temp_dir,
+                folder_type="checkpoints"
+            )
+            assert False, "Expected a FileExistsError without overwrite=True"
+        except FileExistsError as e:
+            print(f"✓ Existing file protected without overwrite flag: {e}")
+
 def test_downloader_lifecycle():
     print("\n--- Testing Downloader Manager Lifecycle ---")
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -158,6 +224,10 @@ if __name__ == "__main__":
     test_civitai_client_url_parsing()
     test_civitai_search()
     test_detector_graph_scanning()
+    test_host_matches_rejects_lookalike_domains()
+    test_redact_url_secrets()
+    test_path_traversal_is_blocked()
+    test_overwrite_protection()
     test_downloader_lifecycle()
     print("\n========================================")
     print("🎉 ALL TESTS PASSED SUCCESSFULLY!")

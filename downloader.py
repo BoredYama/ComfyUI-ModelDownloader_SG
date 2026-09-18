@@ -20,6 +20,19 @@ try:
 except ImportError:
     HAS_FOLDER_PATHS = False
 
+def redact_url_secrets(url: str) -> str:
+    """Masks sensitive query params (e.g. Civitai's ?token=) before a URL is ever sent to the client."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.query:
+            return url
+        params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        redacted = [(k, "***" if k.lower() == "token" else v) for k, v in params]
+        return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(redacted, safe="*")))
+    except Exception:
+        return url
+
+
 class DownloadTask:
     def __init__(self, task_id: str, url: str, target_path: str, filename: str, folder_type: str = ""):
         self.id = task_id
@@ -48,7 +61,7 @@ class DownloadTask:
             "filename": self.filename,
             "folder_type": self.folder_type,
             "target_path": self.target_path,
-            "url": self.url,
+            "url": redact_url_secrets(self.url),
             "status": self.status,
             "total_bytes": self.total_bytes,
             "downloaded_bytes": self.downloaded_bytes,
@@ -57,6 +70,17 @@ class DownloadTask:
             "eta_seconds": int(self.eta_seconds),
             "error": self.error_message
         }
+
+
+def host_matches(netloc: str, domain: str) -> bool:
+    """
+    Exact/subdomain host match (e.g. 'huggingface.co' matches 'huggingface.co' and
+    'files.huggingface.co', but NOT 'huggingface.co.evil.com' or 'nothuggingface.co').
+    Guards against substring-match token leaks to look-alike hosts.
+    """
+    host = (netloc or "").split("@")[-1].split(":")[0].lower()
+    domain = domain.lower()
+    return host == domain or host.endswith("." + domain)
 
 
 class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -78,6 +102,9 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         return new_req
 
 
+MAX_FINISHED_TASKS = 50  # cap retained completed/failed/cancelled tasks so history doesn't grow forever
+
+
 class DownloadManager:
     _instance = None
 
@@ -86,6 +113,8 @@ class DownloadManager:
             cls._instance = super(DownloadManager, cls).__new__(cls)
             cls._instance.tasks = {}
             cls._instance.lock = threading.Lock()
+            cls._instance.queue = []  # task_ids waiting for a concurrency slot
+            cls._instance._active_count = 0
         return cls._instance
 
     def get_all_tasks(self):
@@ -103,24 +132,98 @@ class DownloadManager:
             if not task:
                 return False
             task.cancel_requested = True
-            if task.status == "downloading":
+            if task.status in ("downloading", "queued", "pending"):
                 task.status = "cancelled"
+            if task_id in self.queue:
+                self.queue.remove(task_id)
             self._notify_progress(task)
             return True
 
-    def start_download(self, url: str, filename: str, target_dir: str, folder_type: str = "") -> str:
-        """Initiates a background download task and returns the task ID."""
-        task_id = str(uuid.uuid4())[:8]
+    def _prune_finished_locked(self):
+        """Keeps only the most recent MAX_FINISHED_TASKS non-active tasks. Caller holds self.lock."""
+        finished_ids = [
+            tid for tid, t in self.tasks.items()
+            if t.status in ("completed", "failed", "cancelled")
+        ]
+        if len(finished_ids) <= MAX_FINISHED_TASKS:
+            return
+        # Oldest tasks were inserted first (dict preserves insertion order)
+        excess = len(finished_ids) - MAX_FINISHED_TASKS
+        for tid in finished_ids[:excess]:
+            self.tasks.pop(tid, None)
+
+    def start_download(self, url: str, filename: str, target_dir: str, folder_type: str = "", overwrite: bool = False) -> str:
+        """
+        Validates the destination is contained within target_dir (no path traversal),
+        registers a task, and either starts it immediately or queues it if the
+        configured concurrency limit is already reached.
+        """
+        parsed_url = urllib.parse.urlparse(url)
+        if parsed_url.scheme not in ("http", "https"):
+            raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme or '(none)'}")
+
+        # Sanitize filename: strip any directory components so a crafted
+        # "../../foo" (or an absolute path) can't escape target_dir.
+        safe_filename = os.path.basename(filename.replace("\\", "/")).strip()
+        if not safe_filename or safe_filename in (".", ".."):
+            raise ValueError("Invalid filename")
+
+        target_dir = os.path.abspath(target_dir)
         os.makedirs(target_dir, exist_ok=True)
-        target_path = os.path.join(target_dir, filename)
+        target_path = os.path.abspath(os.path.join(target_dir, safe_filename))
 
-        task = DownloadTask(task_id, url, target_path, filename, folder_type)
+        # Belt-and-braces: confirm the resolved path is still inside target_dir
+        if os.path.commonpath([target_dir, target_path]) != target_dir:
+            raise ValueError("Resolved download path escapes the target directory")
+
+        if os.path.exists(target_path) and not overwrite:
+            raise FileExistsError(f"'{safe_filename}' already exists in the target folder")
+
+        task_id = str(uuid.uuid4())[:8]
+        task = DownloadTask(task_id, url, target_path, safe_filename, folder_type)
+
         with self.lock:
+            self._prune_finished_locked()
             self.tasks[task_id] = task
+            max_concurrent = max(1, int(config_manager.get("max_concurrent_downloads", 2) or 2))
+            if self._active_count < max_concurrent:
+                self._active_count += 1
+                start_now = True
+            else:
+                task.status = "queued"
+                self.queue.append(task_id)
+                start_now = False
 
-        thread = threading.Thread(target=self._download_worker, args=(task,), daemon=True)
-        thread.start()
+        if start_now:
+            thread = threading.Thread(target=self._run_task, args=(task,), daemon=True)
+            thread.start()
+        else:
+            self._notify_progress(task)
+
         return task_id
+
+    def _run_task(self, task: DownloadTask):
+        """Runs a single download then releases its concurrency slot and starts the next queued task."""
+        try:
+            self._download_worker(task)
+        finally:
+            self._start_next_queued()
+
+    def _start_next_queued(self):
+        next_task = None
+        with self.lock:
+            while self.queue:
+                tid = self.queue.pop(0)
+                candidate = self.tasks.get(tid)
+                if candidate and candidate.status == "queued":
+                    next_task = candidate
+                    break
+            if next_task is None:
+                self._active_count = max(0, self._active_count - 1)
+
+        if next_task:
+            thread = threading.Thread(target=self._run_task, args=(next_task,), daemon=True)
+            thread.start()
 
     def _notify_progress(self, task: DownloadTask):
         """Broadcasts download progress via ComfyUI WebSocket."""
@@ -146,6 +249,16 @@ class DownloadManager:
             except Exception:
                 pass
 
+    def _finish_cancelled(self, task: DownloadTask):
+        """Marks a task cancelled and removes its partial .downloading file (explicit cancel = discard)."""
+        task.status = "cancelled"
+        try:
+            if os.path.exists(task.temp_path):
+                os.remove(task.temp_path)
+        except OSError as e:
+            print(f"[ModelDownloader] Failed to remove temp file after cancel: {e}")
+        self._notify_progress(task)
+
     def _download_worker(self, task: DownloadTask):
         task.status = "downloading"
         task.start_time = time.time()
@@ -162,13 +275,14 @@ class DownloadManager:
             "User-Agent": "ComfyUI-MissingModelDownloader"
         }
 
-        # Attach token if appropriate
+        # Attach token if appropriate (exact-host match only, never a substring match,
+        # so a look-alike domain can't trick us into leaking the bearer token)
         parsed_url = urllib.parse.urlparse(task.url)
-        if "huggingface.co" in parsed_url.netloc:
+        if host_matches(parsed_url.netloc, "huggingface.co"):
             hf_token = config_manager.get_hf_token()
             if hf_token:
                 headers["Authorization"] = f"Bearer {hf_token}"
-        elif "civitai.com" in parsed_url.netloc:
+        elif host_matches(parsed_url.netloc, "civitai.com"):
             civitai_token = config_manager.get_civitai_token()
             if civitai_token and "token=" not in task.url:
                 headers["Authorization"] = f"Bearer {civitai_token}"
@@ -203,8 +317,8 @@ class DownloadManager:
                 with open(task.temp_path, write_mode) as f:
                     while True:
                         if task.cancel_requested:
-                            task.status = "cancelled"
-                            self._notify_progress(task)
+                            f.close()
+                            self._finish_cancelled(task)
                             return
 
                         chunk = resp.read(chunk_size)
@@ -238,8 +352,7 @@ class DownloadManager:
 
             # Finished streaming
             if task.cancel_requested:
-                task.status = "cancelled"
-                self._notify_progress(task)
+                self._finish_cancelled(task)
                 return
 
             # Rename temp file to destination

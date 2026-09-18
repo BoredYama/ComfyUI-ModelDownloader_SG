@@ -15,6 +15,16 @@ const SORTED_FOLDERS = [
     "upscale_models", "vae"
 ];
 
+// Escapes text before it's interpolated into an innerHTML template. Model filenames, node
+// types, and search-result metadata all originate from workflow files or third-party APIs,
+// so they must never be trusted as raw HTML.
+function escapeHtml(value) {
+    const str = value === null || value === undefined ? "" : String(value);
+    const div = document.createElement("div");
+    div.textContent = str;
+    return div.innerHTML;
+}
+
 class MissingModelDownloaderUI {
     constructor() {
         this.missingModels = [];
@@ -555,10 +565,10 @@ class MissingModelDownloaderUI {
             card.innerHTML = `
                 <div class="mmd-card-header">
                     <div>
-                        <div class="mmd-model-title">${model.filename}</div>
+                        <div class="mmd-model-title">${escapeHtml(model.filename)}</div>
                         <div class="mmd-model-meta" style="margin-top: 4px;">
-                            <span class="mmd-tag mmd-tag-node">${model.node_type}</span>
-                            <span>${model.widget_name}</span>
+                            <span class="mmd-tag mmd-tag-node">${escapeHtml(model.node_type)}</span>
+                            <span>${escapeHtml(model.widget_name)}</span>
                         </div>
                     </div>
                     <div style="display: flex; align-items: center; gap: 6px;">
@@ -644,16 +654,21 @@ class MissingModelDownloaderUI {
                     ? `<span class="mmd-tag" style="background: var(--mmd-danger-bg); color: var(--mmd-danger);">Auth</span>`
                     : "";
 
+                const thumbHtml = res.thumbnail
+                    ? `<img src="${escapeHtml(res.thumbnail)}" alt="" class="mmd-result-thumb" loading="lazy" />`
+                    : "";
+
                 item.innerHTML = `
+                    ${thumbHtml}
                     <div class="mmd-result-info">
                         <div style="display: flex; align-items: center; gap: 5px; flex-wrap: wrap;">
                             ${sourceBadge}${exactBadge}${gatedBadge}
-                            <span class="mmd-result-name">${res.name || filename}</span>
+                            <span class="mmd-result-name">${escapeHtml(res.name || filename)}</span>
                         </div>
                         <div class="mmd-result-details">
-                            <span>${res.repo_id || res.creator || res.model_name || "—"}</span>
+                            <span>${escapeHtml(res.repo_id || res.creator || res.model_name || "—")}</span>
                             <span>· ${sizeDisplay}</span>
-                            ${res.downloads ? `<span>· ${res.downloads.toLocaleString()} dl</span>` : ""}
+                            ${res.downloads ? `<span>· ${Number(res.downloads).toLocaleString()} dl</span>` : ""}
                         </div>
                     </div>
                     <button class="mmd-btn mmd-btn-primary mmd-dl-btn">Download</button>
@@ -677,22 +692,30 @@ class MissingModelDownloaderUI {
         }
     }
 
-    async startDownload(url, filename, folderType, targetDir = "") {
+    async startDownload(url, filename, folderType, targetDir = "", overwrite = false) {
         try {
             const resp = await api.fetchApi("/model_downloader/start_download", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ url, filename, folder_type: folderType, target_dir: targetDir })
+                body: JSON.stringify({ url, filename, folder_type: folderType, target_dir: targetDir, overwrite })
             });
 
             if (resp.ok) {
                 this.showToast(`Starting: ${filename}`);
                 const dlTab = this.modal.querySelector('.mmd-tab[data-tab="downloads"]');
                 if (dlTab) dlTab.click();
-            } else {
-                const err = await resp.json();
-                this.showToast(err.message || "Download failed.", true);
+                return;
             }
+
+            const err = await resp.json();
+            if (resp.status === 409) {
+                const confirmed = window.confirm(`"${filename}" already exists in the target folder. Overwrite it?`);
+                if (confirmed) {
+                    await this.startDownload(url, filename, folderType, targetDir, true);
+                }
+                return;
+            }
+            this.showToast(err.message || "Download failed.", true);
         } catch (e) {
             this.showToast(e.message, true);
         }
@@ -753,6 +776,7 @@ class MissingModelDownloaderUI {
             const isDone = task.status === "completed";
             const isFailed = task.status === "failed";
             const isCancelled = task.status === "cancelled";
+            const isQueued = task.status === "queued" || task.status === "pending";
             const isDownloading = task.status === "downloading";
 
             let statusText = "";
@@ -760,6 +784,7 @@ class MissingModelDownloaderUI {
             if (isDone) { statusText = "Completed"; statusColor = "var(--mmd-success)"; }
             else if (isFailed) { statusText = "Failed"; statusColor = "var(--mmd-danger)"; }
             else if (isCancelled) { statusText = "Cancelled"; statusColor = "var(--mmd-text-muted)"; }
+            else if (isQueued) { statusText = "Queued"; statusColor = "var(--mmd-warn)"; }
             else { statusText = "Downloading"; statusColor = "var(--mmd-text-secondary)"; }
 
             const dlMB = ((task.downloaded_bytes || 0) / (1024 * 1024)).toFixed(1);
@@ -780,21 +805,22 @@ class MissingModelDownloaderUI {
             card.innerHTML = `
                 <div class="mmd-card-header">
                     <div>
-                        <div class="mmd-model-title">${task.filename}</div>
+                        <div class="mmd-model-title">${escapeHtml(task.filename)}</div>
                         <div class="mmd-model-meta" style="margin-top: 3px;">
                             <span style="color: ${statusColor}; font-size: 10px; font-weight: 600; text-transform: uppercase;">${statusText}</span>
-                            <span class="mmd-tag mmd-tag-folder">${task.folder_type}</span>
+                            <span class="mmd-tag mmd-tag-folder">${escapeHtml(task.folder_type)}</span>
                         </div>
                     </div>
-                    ${isDownloading ? `<button class="mmd-btn mmd-btn-danger mmd-cancel-btn">Cancel</button>` : ""}
+                    ${(isDownloading || isQueued) ? `<button class="mmd-btn mmd-btn-danger mmd-cancel-btn">Cancel</button>` : ""}
+                    ${isFailed ? `<button class="mmd-btn mmd-btn-outline mmd-retry-btn">Retry</button>` : ""}
                 </div>
                 <div class="mmd-progress-wrap">
                     <div class="mmd-progress-bar" style="width: ${task.percentage || 0}%;"></div>
                 </div>
-                <div style="font-size: 11px; color: var(--mmd-text-muted);">${statsText}</div>
+                <div style="font-size: 11px; color: var(--mmd-text-muted);">${escapeHtml(statsText)}</div>
             `;
 
-            if (isDownloading) {
+            if (isDownloading || isQueued) {
                 card.querySelector(".mmd-cancel-btn").onclick = async () => {
                     await api.fetchApi("/model_downloader/cancel_download", {
                         method: "POST",
@@ -802,6 +828,12 @@ class MissingModelDownloaderUI {
                         body: JSON.stringify({ task_id: task.id })
                     });
                     this.showToast(`Cancelled: ${task.filename}`);
+                };
+            }
+
+            if (isFailed) {
+                card.querySelector(".mmd-retry-btn").onclick = () => {
+                    this.startDownload(task.url, task.filename, task.folder_type, "", true);
                 };
             }
 

@@ -181,6 +181,7 @@ try:
             filename = data.get("filename", "").strip()
             folder_type = data.get("folder_type", "checkpoints").strip()
             target_dir = data.get("target_dir", "").strip()
+            overwrite = bool(data.get("overwrite", False))
 
             if not url or not filename:
                 return web.json_response({"status": "error", "message": "Missing url or filename"}, status=400)
@@ -188,7 +189,7 @@ try:
             if not target_dir:
                 target_dir = detector.get_target_directory(folder_type)
 
-            task_id = download_manager.start_download(url, filename, target_dir, folder_type)
+            task_id = download_manager.start_download(url, filename, target_dir, folder_type, overwrite=overwrite)
             return web.json_response({
                 "status": "success",
                 "task_id": task_id,
@@ -196,8 +197,12 @@ try:
                 "folder_type": folder_type,
                 "target_dir": target_dir
             })
-        except Exception as e:
+        except FileExistsError as e:
+            return web.json_response({"status": "exists", "message": str(e)}, status=409)
+        except ValueError as e:
             return web.json_response({"status": "error", "message": str(e)}, status=400)
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
 
     @routes.post("/model_downloader/cancel_download")
     async def cancel_download(request):

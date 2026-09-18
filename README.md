@@ -34,7 +34,7 @@ Once installed, the addon adds:
 
 ```bash
 cd <your-comfyui-path>/custom_nodes/
-git clone https://github.com/yourusername/ComfyUI-ModelDownloader_SG.git
+git clone https://github.com/BoredYama/ComfyUI-ModelDownloader_SG.git
 cd ComfyUI-ModelDownloader_SG
 pip install -r requirements.txt
 ```
@@ -96,6 +96,21 @@ The addon also registers a passthrough node called **"📦 Model Downloader (SG)
 - Python 3.9+
 - `aiohttp >= 3.8.0`
 - `requests >= 2.28.0`
+
+## 🔒 v1.1.0 Changes
+
+Security and reliability pass:
+
+- Fixed a token-leak bug where a look-alike domain (e.g. `huggingface.co.evil.com`) could receive your HF/Civitai bearer token due to a substring host check.
+- Fixed a path-traversal bug in the download endpoint — filenames are now sanitized and the resolved path is verified to stay inside the target folder.
+- Blocked non-`http(s)` URL schemes (previously a `file://` URL could be used to read local files off disk).
+- Civitai API tokens are no longer embedded in download URLs (sent only via the `Authorization` header), and any token accidentally left in a URL is redacted before it's ever sent back to the browser or over the WebSocket.
+- `max_concurrent_downloads` (already in Settings) is now actually enforced — extra downloads queue instead of all firing at once.
+- Downloads to a filename that already exists now prompt for confirmation instead of silently overwriting.
+- Cancelling a download now cleans up its partial `.downloading` file; failed downloads got a **Retry** button.
+- Escaped all workflow/API-derived text before rendering it in the UI (was vulnerable to injected HTML via a crafted workflow file or search result).
+- Task history is capped so long sessions don't grow the download list forever.
+- Civitai search results now show a thumbnail image.
 
 ## 📄 License
 
