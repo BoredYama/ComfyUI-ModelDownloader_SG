@@ -152,6 +152,7 @@ class HuggingFaceClient:
         SYNONYMS = {
             "umt5": "wan",
             "ltx23": "ltx",
+            "ltx25": "ltx",
             "ltx_video": "ltx",
             "clip_g": "sdxl",
             "clip_l": "sdxl",
@@ -169,6 +170,17 @@ class HuggingFaceClient:
                         fallback_kw = syn_v
 
         primary_keyword = keywords[0] if keywords else clean_query
+        
+        # Build a version-expanded search query for cases like LTX25 -> LTX-2.5, wan22 -> wan-2.2
+        # This helps find repos named "LTX-2.5-Quantized" when the filename says "LTX25"
+        def expand_versions(text):
+            """Split concatenated name+version like LTX25 into LTX 2.5, wan22 into wan 2.2"""
+            # Pattern: letters followed by digits, where digits look like a version (2-4 chars)
+            expanded = re.sub(r'([a-zA-Z]+)(\d)(\d)(?=[^0-9]|$)', 
+                            lambda m: f"{m.group(1)}-{m.group(2)}.{m.group(3)}", text)
+            return expanded if expanded != text else None
+        
+        version_expanded_query = expand_versions(clean_query)
 
         results = []
         token = config_manager.get_hf_token()
@@ -201,6 +213,62 @@ class HuggingFaceClient:
             except Exception:
                 pass
 
+        # 1b. If still few results, try version-expanded and spaced-keyword searches WITH full=true
+        # This finds repos where the file is inside but the repo name doesn't match the filename
+        if len(matched_repos) < 5:
+            extra_queries = []
+            
+            # Extract meaningful keywords (skip noise like fp16, mix, w4a8, 17GB, etc.)
+            meaningful_kws = [k for k in keywords if len(k) >= 3 and not re.match(
+                r'^(?:fp\d+|bf\d+|int\d+|q\d|mix\d*|w\d+a?\d*|x\d+|\d+GB?|scaled|pruned|ema|only)$', k, re.I)]
+            
+            # Version-expanded first keyword: LTX25 -> LTX-2.5
+            expanded_first = expand_versions(keywords[0]) if keywords else None
+            if expanded_first:
+                expanded_first = re.sub(r'[-_]', ' ', expanded_first)
+            
+            # Build candidate queries (order matters - best first)
+            if expanded_first:
+                # "LTX 2.5 comfy" - version expanded + comfy keyword if present
+                if 'comfy' in [k.lower() for k in meaningful_kws]:
+                    extra_queries.append(f"{expanded_first} comfy")
+                # "LTX 2.5" alone
+                extra_queries.append(expanded_first)
+                # "LTX 2.5 quantized/distilled" - version expanded + second meaningful keyword
+                for mk in meaningful_kws[1:3]:
+                    if mk.lower() != 'comfy':
+                        extra_queries.append(f"{expanded_first} {mk}")
+            
+            # Also try original first keyword + comfy (e.g. "gemma4 comfy ltx25")
+            if len(meaningful_kws) >= 2:
+                extra_queries.append(' '.join(meaningful_kws[:3]))
+            
+            # Deduplicate while preserving order
+            seen = set()
+            unique_queries = []
+            for q in extra_queries:
+                ql = q.lower()
+                if ql not in seen:
+                    seen.add(ql)
+                    unique_queries.append(q)
+            
+            existing_ids = {r.get("id") for r in matched_repos}
+            for eq in unique_queries[:3]:  # Limit to 3 extra searches to avoid slowdowns
+                try:
+                    eq_url = f"{HF_API_BASE}/models?search={urllib.parse.quote(eq)}&limit=10&full=true"
+                    req = urllib.request.Request(eq_url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        extra_repos = json.loads(resp.read().decode("utf-8"))
+                        for er in extra_repos:
+                            if er.get("id") not in existing_ids:
+                                existing_ids.add(er.get("id"))
+                                matched_repos.append(er)
+                                # These repos came with full=true so they have siblings already
+                                # Parse them immediately for file matches
+                                self._parse_repo_detail(er, raw_query, clean_query, results)
+                except Exception:
+                    pass
+
         # Sort matched_repos to prioritize ones matching more keywords from the filename
         if matched_repos and len(matched_repos) > 1:
             def score_repo(r):
@@ -208,10 +276,14 @@ class HuggingFaceClient:
                 return sum(1 for k in keywords if len(k) > 2 and k.lower() in rid)
             matched_repos.sort(key=score_repo, reverse=True)
 
+
         # 2. For the top candidate repositories, fetch repo details to inspect siblings (files)
         for repo_info in matched_repos[:8]:
             repo_id = repo_info.get("id")
             if not repo_id:
+                continue
+            # Skip repos already parsed with full=true (they have siblings data)
+            if repo_info.get("siblings"):
                 continue
             try:
                 detail_url = f"{HF_API_BASE}/models/{repo_id}"
