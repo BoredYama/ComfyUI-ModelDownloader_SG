@@ -68,7 +68,8 @@ class HuggingFaceClient:
         is_gated = repo_detail.get("gated", False)
         downloads = repo_detail.get("downloads", 0)
         likes = repo_detail.get("likes", 0)
-        target_filename_lower = raw_query.lower()
+        # Clean up known user-added suffixes like _KJ which aren't in the actual repo filenames
+        target_filename_lower = re.sub(r'(?i)[-_]kj(\.[a-z0-9]+)$', r'\1', raw_query.lower())
         
         # Strip extension from target for matching
         target_stem = target_filename_lower
@@ -348,13 +349,13 @@ class HuggingFaceClient:
                         "exact_match": False
                     })
 
-        # 3. Fallback for ComfyUI orgs if no exact match is found and few results
-        if not any(r["exact_match"] for r in results) and len(results) < 8:
+        # 3. Fallback for ComfyUI orgs if no exact match is found
+        if not any(r["exact_match"] for r in results):
             KNOWN_ORGS = [
                 "Comfy-Org", "Kijai", "city96", "lllyasviel", 
                 "black-forest-labs", "stabilityai", "mcmonkey", 
                 "RunDiffusion", "cocktailpeanut", "ByteDance",
-                "lightx2v", "bartowski", "mradermacher", "Lightricks", "joeygambino"
+                "lightx2v", "bartowski", "mradermacher", "Lightricks", "joeygambino", "LootingGod"
             ]
             
             def fetch_org(org):
