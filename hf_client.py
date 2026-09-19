@@ -358,9 +358,13 @@ class HuggingFaceClient:
                 "lightx2v", "bartowski", "mradermacher", "Lightricks", "joeygambino", "LootingGod"
             ]
             
+            # Better fallback keyword that doesn't split version numbers (e.g. wan2.2)
+            fallback_kw = re.split(r'[-_\s]+', clean_query)[0] if clean_query else ""
+            
             def fetch_org(org):
-                url1 = f"{HF_API_BASE}/models?author={org}&search={urllib.parse.quote(fallback_kw)}&limit=4&full=true"
-                url2 = f"{HF_API_BASE}/models?author={org}&sort=downloads&limit=5&full=true"
+                org_results = []
+                url1 = f"{HF_API_BASE}/models?author={org}&search={urllib.parse.quote(fallback_kw)}&limit=10&full=true"
+                url2 = f"{HF_API_BASE}/models?author={org}&sort=downloads&limit=10&full=true"
                 repos = []
                 for url in [url1, url2]:
                     try:
