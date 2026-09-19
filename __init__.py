@@ -123,15 +123,17 @@ try:
                 return web.json_response({"results": []})
 
             results = []
+            import asyncio
+            loop = asyncio.get_event_loop()
 
             # Hugging Face Search (Priority)
             if provider in ("all", "huggingface"):
-                hf_results = hf_client.search_for_model(query, limit=limit)
+                hf_results = await loop.run_in_executor(None, hf_client.search_for_model, query, limit)
                 results.extend(hf_results)
 
             # Civitai Search
             if provider in ("all", "civitai"):
-                civitai_results = civitai_client.search_for_model(query, limit=limit)
+                civitai_results = await loop.run_in_executor(None, civitai_client.search_for_model, query, limit)
                 results.extend(civitai_results)
 
             # Ensure exact matches and Hugging Face results are appropriately prioritized
@@ -154,10 +156,13 @@ try:
             if not url:
                 return web.json_response({"valid": False, "error": "URL is empty"}, status=400)
 
+            import asyncio
+            loop = asyncio.get_event_loop()
+
             if "huggingface.co" in url:
-                parsed = hf_client.parse_direct_url(url)
+                parsed = await loop.run_in_executor(None, hf_client.parse_direct_url, url)
             elif "civitai.com" in url:
-                parsed = civitai_client.parse_direct_url(url)
+                parsed = await loop.run_in_executor(None, civitai_client.parse_direct_url, url)
             else:
                 # Generic direct URL
                 filename = url.split("?")[0].split("/")[-1] or "model.safetensors"

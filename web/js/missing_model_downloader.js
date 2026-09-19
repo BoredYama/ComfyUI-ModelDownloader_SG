@@ -967,9 +967,11 @@ class MissingModelDownloaderUI {
             const resp = await api.fetchApi("/model_downloader/downloads");
             if (resp.ok) {
                 const data = await resp.json();
+                const newDownloads = {};
                 (data.downloads || []).forEach(task => {
-                    this.activeDownloads[task.id] = task;
+                    newDownloads[task.id] = task;
                 });
+                this.activeDownloads = newDownloads;
                 this.updateDownloadsTab();
             }
         } catch (e) { /* silent */ }
