@@ -452,6 +452,7 @@ class MissingModelDownloaderUI {
 
                 <div class="mmd-tabs">
                     <button class="mmd-tab active" data-tab="missing">Missing Models</button>
+                    <button class="mmd-tab" data-tab="search">Search</button>
                     <button class="mmd-tab" data-tab="downloads">Active Downloads</button>
                     <button class="mmd-tab" data-tab="direct">Direct Download</button>
                     <button class="mmd-tab" data-tab="settings">Settings</button>
@@ -467,6 +468,29 @@ class MissingModelDownloaderUI {
                             <button class="mmd-btn mmd-btn-outline" id="mmd-rescan-btn">Rescan</button>
                         </div>
                         <div id="mmd-missing-list" style="display: flex; flex-direction: column; gap: 8px;"></div>
+                    </div>
+
+                    <!-- Tab 1.5: Global Search -->
+                    <div class="mmd-panel" id="mmd-panel-search">
+                        <div class="mmd-card">
+                            <div style="margin-bottom: 12px; font-size: 13px; color: var(--mmd-text-secondary);">
+                                Search Hugging Face and Civitai directly and download models to a specific folder.
+                            </div>
+                            <div style="display: flex; gap: 8px; margin-bottom: 16px;">
+                                <input type="text" class="mmd-input" id="mmd-global-search-input" placeholder="Enter model name or keywords..." style="flex: 1;" />
+                                <select class="mmd-select" id="mmd-global-search-folder" style="width: 150px;">
+                                    ${folderOptionsHTML}
+                                </select>
+                                <button class="mmd-btn mmd-btn-primary" id="mmd-global-search-btn">Search</button>
+                            </div>
+                            <div id="mmd-global-search-results" style="display: flex; flex-direction: column; gap: 8px;">
+                                <div class="mmd-empty-state">
+                                    <div class="icon">🔍</div>
+                                    <div style="font-size: 13px; font-weight: 500; color: var(--mmd-text-secondary);">Search for models</div>
+                                    <div style="font-size: 12px;">Type a model name to search Hugging Face and Civitai.</div>
+                                </div>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- Tab 2: Active Downloads -->
@@ -603,6 +627,26 @@ class MissingModelDownloaderUI {
                 this.fetchActiveDownloads();
             } catch (e) {}
         };
+
+        const globalSearchInput = backdrop.querySelector("#mmd-global-search-input");
+        const globalSearchBtn = backdrop.querySelector("#mmd-global-search-btn");
+        const globalSearchFolder = backdrop.querySelector("#mmd-global-search-folder");
+        const globalSearchResults = backdrop.querySelector("#mmd-global-search-results");
+
+        if (globalSearchBtn) {
+            globalSearchBtn.onclick = () => this.performGlobalSearch(
+                globalSearchInput.value, 
+                globalSearchFolder.value, 
+                globalSearchResults, 
+                globalSearchBtn
+            );
+            globalSearchInput.addEventListener("keydown", (e) => {
+                if (e.key === "Enter") {
+                    globalSearchBtn.click();
+                }
+            });
+        }
+
         backdrop.querySelector("#mmd-direct-start-btn").onclick = () => this.handleDirectDownload();
         backdrop.querySelector("#mmd-save-settings-btn").onclick = () => this.handleSaveSettings();
         backdrop.querySelector("#mmd-verify-hf-btn").onclick = () => this.handleVerifyHfToken();
@@ -614,6 +658,11 @@ class MissingModelDownloaderUI {
         this.modal.classList.add("active");
         this.populateSettingsFields();
         this.fetchActiveDownloads();
+
+        const globalSearchFolder = this.modal.querySelector("#mmd-global-search-folder");
+        if (globalSearchFolder && globalSearchFolder.children.length === 0) {
+            globalSearchFolder.innerHTML = this.buildFolderOptions(SORTED_FOLDERS, "checkpoints");
+        }
     }
 
     closeModal() {
@@ -840,63 +889,7 @@ class MissingModelDownloaderUI {
 
             container.innerHTML = "";
             results.forEach(res => {
-                const item = document.createElement("div");
-                item.className = "mmd-result-item";
-
-                const isHF = res.source === "huggingface";
-                const sourceBadge = `<span class="mmd-tag mmd-tag-hf">${isHF ? "HF" : "Civitai"}</span>`;
-
-                const exactBadge = res.exact_match
-                    ? `<span class="mmd-tag" style="background: var(--mmd-success-bg); color: var(--mmd-success);">Exact</span>`
-                    : "";
-
-                const sizeDisplay = res.size_bytes > 0
-                    ? `${(res.size_bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
-                    : "—";
-
-                const gatedBadge = res.is_gated
-                    ? `<span class="mmd-tag" style="background: var(--mmd-danger-bg); color: var(--mmd-danger);">Auth</span>`
-                    : "";
-
-                const thumbHtml = res.thumbnail
-                    ? `<img src="${escapeHtml(res.thumbnail)}" alt="" class="mmd-result-thumb" loading="lazy" />`
-                    : "";
-
-                item.innerHTML = `
-                    ${thumbHtml}
-                    <div class="mmd-result-info">
-                        <div style="display: flex; align-items: center; gap: 5px; flex-wrap: wrap;">
-                            ${sourceBadge}${exactBadge}${gatedBadge}
-                            <span class="mmd-result-name">${escapeHtml(res.name || filename)}</span>
-                        </div>
-                        <div class="mmd-result-details">
-                            <span>${escapeHtml(res.repo_id || res.creator || res.model_name || "—")}</span>
-                            <span>· ${sizeDisplay}</span>
-                            ${res.downloads ? `<span>· ${Number(res.downloads).toLocaleString()} dl</span>` : ""}
-                        </div>
-                    </div>
-                    <button class="mmd-btn mmd-btn-primary mmd-dl-btn">Download</button>
-                `;
-
-                item.querySelector(".mmd-dl-btn").onclick = (e) => {
-                    const btn = e.target;
-                    this.startDownload(res.download_url, filename, folderType, "", false, res.sha256, () => {
-                        btn.textContent = "Downloading...";
-                        btn.style.backgroundColor = "var(--mmd-success)";
-                        btn.style.borderColor = "var(--mmd-success)";
-                        btn.style.color = "white";
-                        btn.disabled = true;
-                        item.style.borderColor = "var(--mmd-success)";
-                        item.style.backgroundColor = "rgba(76, 175, 80, 0.05)";
-                        
-                        // Also highlight the parent card if possible
-                        const parentCard = item.closest(".mmd-card");
-                        if (parentCard) {
-                            parentCard.style.borderColor = "var(--mmd-success)";
-                        }
-                    });
-                };
-
+                const item = this.createResultItemElement(res, folderType, filename);
                 container.appendChild(item);
             });
             
@@ -1094,6 +1087,108 @@ class MissingModelDownloaderUI {
 
         activeTasks.slice().reverse().forEach(task => renderCard(task, list));
         historyTasks.slice().reverse().forEach(task => renderCard(task, historyList));
+    }
+
+    createResultItemElement(res, folderType, filenameFallback) {
+        const item = document.createElement("div");
+        item.className = "mmd-result-item";
+
+        const isHF = res.source === "huggingface";
+        const sourceBadge = `<span class="mmd-tag mmd-tag-hf">${isHF ? "HF" : "Civitai"}</span>`;
+
+        const exactBadge = res.exact_match
+            ? `<span class="mmd-tag" style="background: var(--mmd-success-bg); color: var(--mmd-success);">Exact</span>`
+            : "";
+
+        const sizeDisplay = res.size_bytes > 0
+            ? `${(res.size_bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
+            : "—";
+
+        const gatedBadge = res.is_gated
+            ? `<span class="mmd-tag" style="background: var(--mmd-danger-bg); color: var(--mmd-danger);">Auth</span>`
+            : "";
+
+        const thumbHtml = res.thumbnail
+            ? `<img src="${escapeHtml(res.thumbnail)}" alt="" class="mmd-result-thumb" loading="lazy" />`
+            : "";
+            
+        const displayName = res.name || filenameFallback;
+
+        item.innerHTML = `
+            ${thumbHtml}
+            <div class="mmd-result-info">
+                <div style="display: flex; align-items: center; gap: 5px; flex-wrap: wrap;">
+                    ${sourceBadge}${exactBadge}${gatedBadge}
+                    <span class="mmd-result-name">${escapeHtml(displayName)}</span>
+                </div>
+                <div class="mmd-result-details">
+                    <span>${escapeHtml(res.repo_id || res.creator || res.model_name || "—")}</span>
+                    <span>· ${sizeDisplay}</span>
+                    ${res.downloads ? `<span>· ${Number(res.downloads).toLocaleString()} dl</span>` : ""}
+                </div>
+            </div>
+            <button class="mmd-btn mmd-btn-primary mmd-dl-btn">Download</button>
+        `;
+
+        item.querySelector(".mmd-dl-btn").onclick = (e) => {
+            const btn = e.target;
+            this.startDownload(res.download_url, displayName, folderType, "", false, res.sha256, () => {
+                btn.textContent = "Downloading...";
+                btn.style.backgroundColor = "var(--mmd-success)";
+                btn.style.borderColor = "var(--mmd-success)";
+                btn.style.color = "white";
+                btn.disabled = true;
+                item.style.borderColor = "var(--mmd-success)";
+                item.style.backgroundColor = "rgba(76, 175, 80, 0.05)";
+                
+                const parentCard = item.closest(".mmd-card");
+                if (parentCard) {
+                    parentCard.style.borderColor = "var(--mmd-success)";
+                }
+            });
+        };
+        
+        return item;
+    }
+
+    async performGlobalSearch(query, folderType, container, btn) {
+        query = (query || "").trim();
+        if (!query) return;
+
+        btn.disabled = true;
+        btn.textContent = "Searching...";
+        container.innerHTML = `<div style="font-size: 11px; color: var(--mmd-text-muted);">Querying sources...</div>`;
+        
+        try {
+            const resp = await api.fetchApi("/model_downloader/search", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ query: query, provider: "all", limit: 20 })
+            });
+            if (!resp.ok) throw new Error("Search failed.");
+            const data = await resp.json();
+            const results = data.results || [];
+
+            if (results.length === 0) {
+                container.innerHTML = `
+                    <div style="font-size: 11px; color: var(--mmd-text-muted); padding: 6px 0;">
+                        No results found.
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = "";
+            results.forEach(res => {
+                const item = this.createResultItemElement(res, folderType, "model.safetensors");
+                container.appendChild(item);
+            });
+        } catch (e) {
+            console.error(e);
+            container.innerHTML = `<div style="font-size: 11px; color: var(--mmd-danger); padding: 6px 0;">Search failed. Check terminal for details.</div>`;
+        } finally {
+            btn.disabled = false;
+            btn.textContent = "Search";
+        }
     }
 
     showBanner(msg) {
