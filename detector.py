@@ -33,6 +33,7 @@ WIDGET_TO_FOLDER = {
     "style_model_name": "style_models",
     "embedding_name": "embeddings",
     "upscale_model_name": "upscale_models",
+    "tiny_vae": "vae_approx",
 }
 
 # Known node type prefix/keyword -> folder type mapping
@@ -54,6 +55,7 @@ NODE_TYPE_TO_FOLDER = {
     "depth": "depth",
     "backgroundremoval": "rembg",
     "birefnet": "inpaint",
+    "taesd": "vae_approx",
 }
 
 MODEL_EXTENSIONS = (".safetensors", ".gguf", ".ckpt", ".pt", ".bin", ".pth", ".onnx")

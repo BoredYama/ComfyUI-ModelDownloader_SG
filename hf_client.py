@@ -32,9 +32,14 @@ class HuggingFaceClient:
             with urllib.request.urlopen(req, timeout=8) as resp:
                 size_str = resp.headers.get("Content-Length")
                 size_bytes = int(size_str) if size_str and size_str.isdigit() else 0
+                etag = resp.headers.get("X-Linked-Etag", "").strip('"')
+                sha256 = ""
+                if etag and len(etag) == 64:
+                    sha256 = etag
                 return {
                     "accessible": True,
                     "size_bytes": size_bytes,
+                    "sha256": sha256,
                     "url": resolve_url,
                     "status_code": resp.status
                 }
@@ -112,6 +117,7 @@ class HuggingFaceClient:
                     "likes": likes,
                     "downloads": downloads,
                     "size_bytes": 0,
+                    "sha256": "",
                     "score": score,
                     "exact_match": is_exact_match
                 })
@@ -134,13 +140,34 @@ class HuggingFaceClient:
                 
         # Remove quantization and precision suffixes (like -Q4_K_M, -Q8_0, -FP16, etc.) 
         # which ruin repo search since repos usually just contain the base model name
-        clean_query = re.sub(r'(?i)[-_]?(?:q[1-8]_[a-z0-9_]+|q[1-8]_[0-9]|fp16|fp32|bf16|int8)$', '', clean_query)
+        clean_query = re.sub(r'(?i)[-_. ]?(?:q[1-8]_[a-z0-9_]+|q[1-8]_[0-9]|fp16|fp32|bf16|int8)$', '', clean_query)
         
         is_gguf = raw_query.lower().endswith(".gguf")
         repo_search_query = clean_query + (" gguf" if is_gguf and 'gguf' not in clean_query.lower() else "")
 
         # Also remove common suffixes like _fp8, _fp16, -pruned for search flexibility
         keywords = re.split(r'[-_.\s]+', clean_query)
+        
+        # Add common ecosystem synonyms to keywords to boost scoring and fallback search
+        SYNONYMS = {
+            "umt5": "wan",
+            "ltx23": "ltx",
+            "ltx_video": "ltx",
+            "clip_g": "sdxl",
+            "clip_l": "sdxl",
+            "t5xxl": "flux",
+            "wan2": "wan"
+        }
+        
+        fallback_kw = keywords[0] if keywords else clean_query
+        for k in list(keywords):
+            for syn_k, syn_v in SYNONYMS.items():
+                if syn_k in k.lower():
+                    if syn_v not in [x.lower() for x in keywords]:
+                        keywords.append(syn_v)
+                    if fallback_kw.lower() == k.lower():
+                        fallback_kw = syn_v
+
         primary_keyword = keywords[0] if keywords else clean_query
 
         results = []
@@ -163,7 +190,7 @@ class HuggingFaceClient:
         if len(matched_repos) < 3 and primary_keyword != repo_search_query and len(primary_keyword) >= 3:
             try:
                 kw_query = primary_keyword + (" gguf" if is_gguf else "")
-                kw_url = f"{HF_API_BASE}/models?search={urllib.parse.quote(kw_query)}&limit=10&full=false"
+                kw_url = f"{HF_API_BASE}/models?search={urllib.parse.quote(kw_query)}&limit=50&full=false"
                 req = urllib.request.Request(kw_url, headers=headers)
                 with urllib.request.urlopen(req, timeout=8) as resp:
                     more_repos = json.loads(resp.read().decode("utf-8"))
@@ -173,6 +200,13 @@ class HuggingFaceClient:
                             matched_repos.append(mr)
             except Exception:
                 pass
+
+        # Sort matched_repos to prioritize ones matching more keywords from the filename
+        if matched_repos and len(matched_repos) > 1:
+            def score_repo(r):
+                rid = (r.get("id") or "").lower()
+                return sum(1 for k in keywords if len(k) > 2 and k.lower() in rid)
+            matched_repos.sort(key=score_repo, reverse=True)
 
         # 2. For the top candidate repositories, fetch repo details to inspect siblings (files)
         for repo_info in matched_repos[:8]:
@@ -207,11 +241,11 @@ class HuggingFaceClient:
                 "Comfy-Org", "Kijai", "city96", "lllyasviel", 
                 "black-forest-labs", "stabilityai", "mcmonkey", 
                 "RunDiffusion", "cocktailpeanut", "ByteDance",
-                "lightx2v"
+                "lightx2v", "bartowski", "mradermacher"
             ]
             
             def fetch_org(org):
-                url1 = f"{HF_API_BASE}/models?author={org}&search={urllib.parse.quote(primary_keyword)}&limit=3&full=true"
+                url1 = f"{HF_API_BASE}/models?author={org}&search={urllib.parse.quote(fallback_kw)}&limit=4&full=true"
                 url2 = f"{HF_API_BASE}/models?author={org}&sort=downloads&limit=5&full=true"
                 repos = []
                 for url in [url1, url2]:
@@ -238,6 +272,7 @@ class HuggingFaceClient:
                 try:
                     info = self.get_file_info(r["repo_id"], r["relative_path"])
                     r["size_bytes"] = info.get("size_bytes", 0)
+                    r["sha256"] = info.get("sha256", "")
                 except Exception:
                     pass
 
@@ -272,7 +307,8 @@ class HuggingFaceClient:
                 "revision": revision,
                 "filename": filename,
                 "file_path": file_path,
-                "download_url": download_url
+                "download_url": download_url,
+                "sha256": ""
             }
 
         # Pattern 2: Model repo link without file

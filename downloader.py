@@ -34,13 +34,14 @@ def redact_url_secrets(url: str) -> str:
 
 
 class DownloadTask:
-    def __init__(self, task_id: str, url: str, target_path: str, filename: str, folder_type: str = ""):
+    def __init__(self, task_id: str, url: str, target_path: str, filename: str, folder_type: str = "", expected_sha256: str = ""):
         self.id = task_id
         self.url = url
         self.target_path = target_path
         self.temp_path = f"{target_path}.downloading"
         self.filename = filename
         self.folder_type = folder_type
+        self.expected_sha256 = expected_sha256
         
         self.status = "pending"  # pending, downloading, completed, failed, cancelled
         self.total_bytes = 0
@@ -51,6 +52,7 @@ class DownloadTask:
         self.error_message = ""
         
         self.cancel_requested = False
+        self.is_paused = False
         self.start_time = 0
         self.last_update_time = 0
         self.last_downloaded_bytes = 0
@@ -62,7 +64,7 @@ class DownloadTask:
             "folder_type": self.folder_type,
             "target_path": self.target_path,
             "url": redact_url_secrets(self.url),
-            "status": self.status,
+            "status": "paused" if self.is_paused else self.status,
             "total_bytes": self.total_bytes,
             "downloaded_bytes": self.downloaded_bytes,
             "percentage": round(self.percentage, 1),
@@ -139,6 +141,40 @@ class DownloadManager:
             self._notify_progress(task)
             return True
 
+    def pause_task(self, task_id: str) -> bool:
+        with self.lock:
+            task = self.tasks.get(task_id)
+            if not task or task.status not in ("downloading", "queued", "pending"):
+                return False
+            task.is_paused = True
+            if task_id in self.queue:
+                self.queue.remove(task_id)
+            self._notify_progress(task)
+            return True
+
+    def resume_task(self, task_id: str) -> bool:
+        with self.lock:
+            task = self.tasks.get(task_id)
+            if not task or not task.is_paused:
+                return False
+            task.is_paused = False
+            task.status = "queued"
+            self.queue.append(task_id)
+            self._notify_progress(task)
+        
+        self._start_next_queued()
+        return True
+
+    def clear_history(self) -> int:
+        cleared = 0
+        with self.lock:
+            active_ids = [tid for tid, t in self.tasks.items() if t.status in ("downloading", "queued", "pending") and not t.is_paused]
+            to_remove = [tid for tid in self.tasks.keys() if tid not in active_ids]
+            for tid in to_remove:
+                del self.tasks[tid]
+                cleared += 1
+        return cleared
+
     def _prune_finished_locked(self):
         """Keeps only the most recent MAX_FINISHED_TASKS non-active tasks. Caller holds self.lock."""
         finished_ids = [
@@ -152,7 +188,7 @@ class DownloadManager:
         for tid in finished_ids[:excess]:
             self.tasks.pop(tid, None)
 
-    def start_download(self, url: str, filename: str, target_dir: str, folder_type: str = "", overwrite: bool = False) -> str:
+    def start_download(self, url: str, filename: str, target_dir: str, folder_type: str = "", overwrite: bool = False, expected_sha256: str = "") -> str:
         """
         Validates the destination is contained within target_dir (no path traversal),
         registers a task, and either starts it immediately or queues it if the
@@ -180,7 +216,7 @@ class DownloadManager:
             raise FileExistsError(f"'{safe_filename}' already exists in the target folder")
 
         task_id = str(uuid.uuid4())[:8]
-        task = DownloadTask(task_id, url, target_path, safe_filename, folder_type)
+        task = DownloadTask(task_id, url, target_path, safe_filename, folder_type, expected_sha256)
 
         with self.lock:
             self._prune_finished_locked()
@@ -320,6 +356,11 @@ class DownloadManager:
                             f.close()
                             self._finish_cancelled(task)
                             return
+                        if task.is_paused:
+                            f.close()
+                            task.status = "paused"
+                            self._notify_progress(task)
+                            return
 
                         chunk = resp.read(chunk_size)
                         if not chunk:
@@ -350,10 +391,37 @@ class DownloadManager:
                             last_bytes_recorded = task.downloaded_bytes
                             self._notify_progress(task)
 
-            # Finished streaming
             if task.cancel_requested:
                 self._finish_cancelled(task)
                 return
+            if task.is_paused:
+                task.status = "paused"
+                self._notify_progress(task)
+                return
+
+            if task.expected_sha256:
+                import hashlib
+                task.status = "verifying"
+                self._notify_progress(task)
+                sha256_hash = hashlib.sha256()
+                try:
+                    with open(task.temp_path, "rb") as f:
+                        for byte_block in iter(lambda: f.read(4096), b""):
+                            sha256_hash.update(byte_block)
+                    actual_sha256 = sha256_hash.hexdigest().lower()
+                    if actual_sha256 != task.expected_sha256.lower():
+                        task.status = "failed"
+                        task.error_message = f"SHA256 mismatch. Expected: {task.expected_sha256}, got: {actual_sha256}"
+                        self._notify_progress(task)
+                        print(f"[ModelDownloader] Download failed: {task.error_message}")
+                        os.remove(task.temp_path)
+                        return
+                except Exception as e:
+                    task.status = "failed"
+                    task.error_message = f"Failed to verify SHA256: {e}"
+                    self._notify_progress(task)
+                    print(f"[ModelDownloader] Hash verification failed: {e}")
+                    return
 
             # Rename temp file to destination
             if os.path.exists(task.target_path):

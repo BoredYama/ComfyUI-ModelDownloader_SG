@@ -182,6 +182,7 @@ try:
             folder_type = data.get("folder_type", "checkpoints").strip()
             target_dir = data.get("target_dir", "").strip()
             overwrite = bool(data.get("overwrite", False))
+            expected_sha256 = data.get("sha256", "").strip()
 
             if not url or not filename:
                 return web.json_response({"status": "error", "message": "Missing url or filename"}, status=400)
@@ -189,7 +190,7 @@ try:
             if not target_dir:
                 target_dir = detector.get_target_directory(folder_type)
 
-            task_id = download_manager.start_download(url, filename, target_dir, folder_type, overwrite=overwrite)
+            task_id = download_manager.start_download(url, filename, target_dir, folder_type, overwrite=overwrite, expected_sha256=expected_sha256)
             return web.json_response({
                 "status": "success",
                 "task_id": task_id,
@@ -212,6 +213,37 @@ try:
             task_id = data.get("task_id", "").strip()
             success = download_manager.cancel_task(task_id)
             return web.json_response({"status": "success" if success else "not_found"})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=400)
+
+    @routes.post("/model_downloader/pause_download")
+    async def pause_download(request):
+        """Pauses an ongoing download."""
+        try:
+            data = await request.json()
+            task_id = data.get("task_id", "").strip()
+            success = download_manager.pause_task(task_id)
+            return web.json_response({"status": "success" if success else "not_found"})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=400)
+
+    @routes.post("/model_downloader/resume_download")
+    async def resume_download(request):
+        """Resumes a paused download."""
+        try:
+            data = await request.json()
+            task_id = data.get("task_id", "").strip()
+            success = download_manager.resume_task(task_id)
+            return web.json_response({"status": "success" if success else "not_found"})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=400)
+
+    @routes.post("/model_downloader/clear_history")
+    async def clear_history(request):
+        """Clears completed/failed/cancelled tasks from history."""
+        try:
+            cleared_count = download_manager.clear_history()
+            return web.json_response({"status": "success", "cleared": cleared_count})
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=400)
 
