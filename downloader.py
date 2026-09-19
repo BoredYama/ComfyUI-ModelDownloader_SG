@@ -117,7 +117,61 @@ class DownloadManager:
             cls._instance.lock = threading.Lock()
             cls._instance.queue = []  # task_ids waiting for a concurrency slot
             cls._instance._active_count = 0
+            cls._instance.load_state()
         return cls._instance
+
+    def load_state(self):
+        tasks_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads.json")
+        if os.path.exists(tasks_file):
+            try:
+                import json
+                with open(tasks_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                for task_dict in data:
+                    t = DownloadTask(
+                        task_id=task_dict["id"],
+                        url=task_dict["url"],
+                        target_path=task_dict["target_path"],
+                        filename=task_dict["filename"],
+                        folder_type=task_dict.get("folder_type", ""),
+                        expected_sha256=task_dict.get("expected_sha256", "")
+                    )
+                    t.status = task_dict["status"]
+                    if t.status in ("downloading", "queued", "pending"):
+                        t.status = "paused"
+                        t.is_paused = True
+                    t.total_bytes = task_dict.get("total_bytes", 0)
+                    t.downloaded_bytes = task_dict.get("downloaded_bytes", 0)
+                    t.percentage = task_dict.get("percentage", 0.0)
+                    t.error_message = task_dict.get("error_message", "")
+                    self.tasks[t.id] = t
+            except Exception as e:
+                print(f"[ModelDownloader] Failed to load downloads.json: {e}")
+
+    def save_state(self):
+        tasks_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads.json")
+        try:
+            import json
+            with self.lock:
+                save_data = []
+                for t in self.tasks.values():
+                    save_data.append({
+                        "id": t.id,
+                        "url": t.url,
+                        "target_path": t.target_path,
+                        "filename": t.filename,
+                        "folder_type": t.folder_type,
+                        "expected_sha256": getattr(t, 'expected_sha256', ""),
+                        "status": "paused" if getattr(t, 'is_paused', False) else t.status,
+                        "total_bytes": getattr(t, 'total_bytes', 0),
+                        "downloaded_bytes": getattr(t, 'downloaded_bytes', 0),
+                        "percentage": getattr(t, 'percentage', 0.0),
+                        "error_message": getattr(t, 'error_message', "")
+                    })
+            with open(tasks_file, "w", encoding="utf-8") as f:
+                json.dump(save_data, f, indent=4)
+        except Exception as e:
+            print(f"[ModelDownloader] Failed to save downloads.json: {e}")
 
     def get_all_tasks(self):
         with self.lock:
@@ -139,7 +193,8 @@ class DownloadManager:
             if task_id in self.queue:
                 self.queue.remove(task_id)
             self._notify_progress(task)
-            return True
+        self.save_state()
+        return True
 
     def pause_task(self, task_id: str) -> bool:
         with self.lock:
@@ -150,7 +205,8 @@ class DownloadManager:
             if task_id in self.queue:
                 self.queue.remove(task_id)
             self._notify_progress(task)
-            return True
+        self.save_state()
+        return True
 
     def resume_task(self, task_id: str) -> bool:
         with self.lock:
@@ -162,6 +218,7 @@ class DownloadManager:
             self.queue.append(task_id)
             self._notify_progress(task)
         
+        self.save_state()
         self._start_next_queued()
         return True
 
@@ -173,6 +230,7 @@ class DownloadManager:
             for tid in to_remove:
                 del self.tasks[tid]
                 cleared += 1
+        self.save_state()
         return cleared
 
     def _prune_finished_locked(self):
@@ -230,6 +288,8 @@ class DownloadManager:
                 self.queue.append(task_id)
                 start_now = False
 
+        self.save_state()
+
         if start_now:
             thread = threading.Thread(target=self._run_task, args=(task,), daemon=True)
             thread.start()
@@ -243,6 +303,7 @@ class DownloadManager:
         try:
             self._download_worker(task)
         finally:
+            self.save_state()
             self._start_next_queued()
 
     def _start_next_queued(self):
@@ -294,6 +355,7 @@ class DownloadManager:
         except OSError as e:
             print(f"[ModelDownloader] Failed to remove temp file after cancel: {e}")
         self._notify_progress(task)
+        self.save_state()
 
     def _download_worker(self, task: DownloadTask):
         task.status = "downloading"
@@ -435,6 +497,7 @@ class DownloadManager:
             self._notify_progress(task)
             self._notify_completion(task)
             print(f"[ModelDownloader] Successfully downloaded: {task.filename} to {task.target_path}")
+            self.save_state()
 
         except urllib.error.HTTPError as e:
             task.status = "failed"
@@ -443,10 +506,12 @@ class DownloadManager:
                 task.error_message += " (Authentication or gated access required. Check your API token)."
             self._notify_progress(task)
             print(f"[ModelDownloader] Download failed: {task.error_message}")
+            self.save_state()
         except Exception as e:
             task.status = "failed"
             task.error_message = str(e)
             self._notify_progress(task)
             print(f"[ModelDownloader] Download exception: {e}")
+            self.save_state()
 
 download_manager = DownloadManager()
