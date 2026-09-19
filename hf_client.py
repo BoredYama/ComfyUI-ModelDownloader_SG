@@ -69,6 +69,17 @@ class HuggingFaceClient:
         downloads = repo_detail.get("downloads", 0)
         likes = repo_detail.get("likes", 0)
         target_filename_lower = raw_query.lower()
+        
+        # Strip extension from target for matching
+        target_stem = target_filename_lower
+        for ext in MODEL_EXTENSIONS:
+            if target_stem.endswith(ext):
+                target_stem = target_stem[:-len(ext)]
+                break
+        
+        # Build keyword set from the target filename for fuzzy matching
+        target_keywords = set(re.split(r'[-_.\s]+', target_stem))
+        target_keywords = {k for k in target_keywords if len(k) >= 2}
 
         for sib in siblings:
             rfilename = sib.get("rfilename", "")
@@ -81,13 +92,34 @@ class HuggingFaceClient:
 
             base_sibling_name = rfilename.split("/")[-1]
             base_sibling_lower = base_sibling_name.lower()
+            
+            # Strip extension from sibling for matching
+            sibling_stem = base_sibling_lower
+            for ext in MODEL_EXTENSIONS:
+                if sibling_stem.endswith(ext):
+                    sibling_stem = sibling_stem[:-len(ext)]
+                    break
 
             # Check match relevance
             is_exact_match = (base_sibling_lower == target_filename_lower)
+            
+            # Substring match (on stems, not full filenames with extensions)
             is_partial_match = (
-                clean_query.lower() in base_sibling_lower or 
-                base_sibling_lower in target_filename_lower
+                clean_query.lower() in sibling_stem or
+                sibling_stem in target_stem or
+                target_stem in sibling_stem
             )
+            
+            # Keyword-based fuzzy match: check how many keywords overlap
+            if not is_exact_match and not is_partial_match and target_keywords:
+                sibling_keywords = set(re.split(r'[-_.\s]+', sibling_stem))
+                sibling_keywords = {k for k in sibling_keywords if len(k) >= 2}
+                if sibling_keywords and target_keywords:
+                    overlap = target_keywords & sibling_keywords
+                    # Require at least 60% keyword overlap AND minimum 3 matching keywords
+                    overlap_ratio = len(overlap) / min(len(target_keywords), len(sibling_keywords))
+                    if overlap_ratio >= 0.6 and len(overlap) >= 3:
+                        is_partial_match = True
 
             if is_exact_match or is_partial_match:
                 resolve_url = f"https://huggingface.co/{repo_id}/resolve/main/{urllib.parse.quote(rfilename)}"
@@ -100,8 +132,15 @@ class HuggingFaceClient:
                 score = 0
                 if is_exact_match:
                     score += 100
-                if clean_query.lower() in base_sibling_lower:
+                if clean_query.lower() in sibling_stem:
                     score += 20
+                elif sibling_stem in target_stem or target_stem in sibling_stem:
+                    score += 15
+                else:
+                    # Fuzzy match - score based on overlap
+                    sibling_keywords = set(re.split(r'[-_.\s]+', sibling_stem))
+                    overlap = target_keywords & sibling_keywords
+                    score += min(len(overlap) * 3, 12)
                 if downloads:
                     score += min(downloads // 1000, 30)
                 if likes:
@@ -157,7 +196,9 @@ class HuggingFaceClient:
             "clip_g": "sdxl",
             "clip_l": "sdxl",
             "t5xxl": "flux",
-            "wan2": "wan"
+            "wan2": "wan",
+            "gemma": "ltx",
+            "svi": "wanvideo"
         }
         
         fallback_kw = keywords[0] if keywords else clean_query
@@ -313,7 +354,7 @@ class HuggingFaceClient:
                 "Comfy-Org", "Kijai", "city96", "lllyasviel", 
                 "black-forest-labs", "stabilityai", "mcmonkey", 
                 "RunDiffusion", "cocktailpeanut", "ByteDance",
-                "lightx2v", "bartowski", "mradermacher"
+                "lightx2v", "bartowski", "mradermacher", "Lightricks", "joeygambino"
             ]
             
             def fetch_org(org):
