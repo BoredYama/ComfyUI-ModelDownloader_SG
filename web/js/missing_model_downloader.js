@@ -359,7 +359,15 @@ class MissingModelDownloaderUI {
                     if (quickDlBtn) {
                         quickDlBtn.style.display = "inline-block";
                         quickDlBtn.onclick = () => {
-                            this.startDownload(exact.download_url, m.filename, cache.folderType, "", false, exact.sha256);
+                            this.startDownload(exact.download_url, m.filename, cache.folderType, "", false, exact.sha256, () => {
+                                quickDlBtn.textContent = "Downloading...";
+                                quickDlBtn.style.backgroundColor = "var(--mmd-success)";
+                                quickDlBtn.disabled = true;
+                                if (card) {
+                                    card.style.borderColor = "var(--mmd-success)";
+                                    card.style.backgroundColor = "rgba(76, 175, 80, 0.05)";
+                                }
+                            });
                         };
                     }
                 } else {
@@ -386,9 +394,28 @@ class MissingModelDownloaderUI {
                 headerAction.textContent = `Download ${exactMatches.length} Exact Matches`;
             }
             headerAction.onclick = () => {
+                headerAction.textContent = "Starting Downloads...";
+                headerAction.disabled = true;
                 exactMatches.forEach(match => {
-                    this.startDownload(match.exactResult.download_url, match.model.filename, match.folderType, "", false, match.exactResult.sha256);
+                    this.startDownload(match.exactResult.download_url, match.model.filename, match.folderType, "", false, match.exactResult.sha256, () => {
+                        const idx = this.missingModels.indexOf(match.model);
+                        if (idx !== -1) {
+                            const matchCard = this.modal ? this.modal.querySelector(`#mmd-missing-card-${idx}`) : null;
+                            if (matchCard) {
+                                matchCard.style.borderColor = "var(--mmd-success)";
+                                matchCard.style.backgroundColor = "rgba(76, 175, 80, 0.05)";
+                                const qBtn = matchCard.querySelector(".mmd-quick-dl-btn");
+                                if (qBtn) {
+                                    qBtn.textContent = "Downloading...";
+                                    qBtn.style.backgroundColor = "var(--mmd-success)";
+                                    qBtn.disabled = true;
+                                }
+                            }
+                        }
+                    });
                 });
+                headerAction.textContent = "Downloads Started ✓";
+                headerAction.style.backgroundColor = "var(--mmd-success)";
             };
         } else if (headerAction) {
             if (headerAction.parentElement === list) {
@@ -851,8 +878,23 @@ class MissingModelDownloaderUI {
                     <button class="mmd-btn mmd-btn-primary mmd-dl-btn">Download</button>
                 `;
 
-                item.querySelector(".mmd-dl-btn").onclick = () => {
-                    this.startDownload(res.download_url, filename, folderType, "", false, res.sha256);
+                item.querySelector(".mmd-dl-btn").onclick = (e) => {
+                    const btn = e.target;
+                    this.startDownload(res.download_url, filename, folderType, "", false, res.sha256, () => {
+                        btn.textContent = "Downloading...";
+                        btn.style.backgroundColor = "var(--mmd-success)";
+                        btn.style.borderColor = "var(--mmd-success)";
+                        btn.style.color = "white";
+                        btn.disabled = true;
+                        item.style.borderColor = "var(--mmd-success)";
+                        item.style.backgroundColor = "rgba(76, 175, 80, 0.05)";
+                        
+                        // Also highlight the parent card if possible
+                        const parentCard = item.closest(".mmd-card");
+                        if (parentCard) {
+                            parentCard.style.borderColor = "var(--mmd-success)";
+                        }
+                    });
                 };
 
                 container.appendChild(item);
@@ -869,7 +911,7 @@ class MissingModelDownloaderUI {
         }
     }
 
-    async startDownload(url, filename, folderType, targetDir = "", overwrite = false, sha256 = "") {
+    async startDownload(url, filename, folderType, targetDir = "", overwrite = false, sha256 = "", uiCallback = null) {
         try {
             const resp = await api.fetchApi("/model_downloader/start_download", {
                 method: "POST",
@@ -879,8 +921,9 @@ class MissingModelDownloaderUI {
 
             if (resp.ok) {
                 this.showToast(`Starting: ${filename}`);
-                const dlTab = this.modal.querySelector('.mmd-tab[data-tab="downloads"]');
-                if (dlTab) dlTab.click();
+                if (uiCallback) {
+                    uiCallback();
+                }
                 return;
             }
 
@@ -888,7 +931,7 @@ class MissingModelDownloaderUI {
             if (resp.status === 409) {
                 const confirmed = window.confirm(`"${filename}" already exists in the target folder. Overwrite it?`);
                 if (confirmed) {
-                    await this.startDownload(url, filename, folderType, targetDir, true);
+                    await this.startDownload(url, filename, folderType, targetDir, true, sha256, uiCallback);
                 }
                 return;
             }
@@ -912,7 +955,10 @@ class MissingModelDownloaderUI {
             if (!filename || !filename.includes(".")) filename = "model.safetensors";
         }
 
-        await this.startDownload(url, filename, folderSelect.value);
+        await this.startDownload(url, filename, folderSelect.value, "", false, "", () => {
+            const dlTab = this.modal.querySelector('.mmd-tab[data-tab="downloads"]');
+            if (dlTab) dlTab.click();
+        });
         urlInput.value = "";
     }
 
