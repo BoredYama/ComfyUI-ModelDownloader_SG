@@ -450,21 +450,31 @@ class DownloadManager:
                 
                 try:
                     with patch('huggingface_hub.utils._tqdm.tqdm', CustomTqdm):
-                        cached_path = hf_hub_download(
-                            repo_id=repo_id,
-                            filename=filename_in_repo,
-                            revision=revision,
-                            token=hf_token if hf_token else None
-                        )
-                        # Hub download completed successfully
-                        shutil.copyfile(cached_path, task.temp_path)
-                        task.downloaded_bytes = os.path.getsize(task.temp_path)
-                        task.total_bytes = task.downloaded_bytes
-                        task.percentage = 100.0
-                        
-                        # Use the same verification and rename logic below
-                        self._finish_success(task)
-                        return
+                        target_dir = os.path.dirname(task.temp_path)
+                        hf_temp_dir = os.path.join(target_dir, f".hf_tmp_{task.id}")
+                        os.makedirs(hf_temp_dir, exist_ok=True)
+
+                        try:
+                            cached_path = hf_hub_download(
+                                repo_id=repo_id,
+                                filename=filename_in_repo,
+                                revision=revision,
+                                local_dir=hf_temp_dir,
+                                token=hf_token if hf_token else None
+                            )
+                            # Hub download completed successfully
+                            # Move from the temp dir to the actual temp path (instant on same drive)
+                            shutil.move(cached_path, task.temp_path)
+                            task.downloaded_bytes = os.path.getsize(task.temp_path)
+                            task.total_bytes = task.downloaded_bytes
+                            task.percentage = 100.0
+                            
+                            # Use the same verification and rename logic below
+                            self._finish_success(task)
+                            return
+                        finally:
+                            if os.path.exists(hf_temp_dir):
+                                shutil.rmtree(hf_temp_dir, ignore_errors=True)
                 except ModuleNotFoundError:
                     task.status = "failed"
                     task.error_message = "huggingface_hub is not installed. Please restart ComfyUI or run: pip install huggingface-hub"
