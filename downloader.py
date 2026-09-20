@@ -357,13 +357,117 @@ class DownloadManager:
         self._notify_progress(task)
         self.save_state()
 
+    def _create_tqdm_class(self, task):
+        import huggingface_hub.utils
+        import time
+        parent = self
+        
+        class CustomTqdm(huggingface_hub.utils.tqdm):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._last_calc_time = time.time()
+                self._last_bytes = self.n
+                self._speed_window = []
+
+            def update(self, n=1):
+                super().update(n)
+                task.downloaded_bytes = self.n
+                task.total_bytes = self.total or 0
+                if task.total_bytes > 0:
+                    task.percentage = (task.downloaded_bytes / task.total_bytes) * 100
+                
+                now = time.time()
+                time_delta = now - self._last_calc_time
+                if time_delta >= 0.5:
+                    bytes_delta = self.n - self._last_bytes
+                    instant_speed = bytes_delta / time_delta
+                    self._speed_window.append(instant_speed)
+                    if len(self._speed_window) > 5:
+                        self._speed_window.pop(0)
+
+                    task.speed_bytes_per_sec = sum(self._speed_window) / len(self._speed_window)
+                    if task.total_bytes > 0:
+                        remaining_bytes = max(0, task.total_bytes - task.downloaded_bytes)
+                        if task.speed_bytes_per_sec > 0:
+                            task.eta_seconds = remaining_bytes / task.speed_bytes_per_sec
+                        else:
+                            task.eta_seconds = 0
+
+                    self._last_calc_time = now
+                    self._last_bytes = self.n
+                    parent._notify_progress(task)
+
+                if task.cancel_requested:
+                    raise KeyboardInterrupt("Cancelled by user")
+                if task.is_paused:
+                    raise KeyboardInterrupt("Paused by user")
+                    
+        return CustomTqdm
+
     def _download_worker(self, task: DownloadTask):
+        import traceback
         task.status = "downloading"
         task.start_time = time.time()
         task.last_update_time = time.time()
         self._notify_progress(task)
+        
+        parsed_url = urllib.parse.urlparse(task.url)
+        
+        # 1. Check if Hugging Face URL
+        if "huggingface.co" in parsed_url.netloc:
+            import re
+            m = re.search(r"huggingface\.co/([^/]+/[^/]+)/(?:resolve|blob)/([^/]+)/(.*)", task.url)
+            if m:
+                repo_id = m.group(1)
+                revision = m.group(2)
+                filename_in_repo = urllib.parse.unquote(m.group(3))
+                hf_token = config_manager.get_hf_token()
+                
+                import huggingface_hub
+                from huggingface_hub import hf_hub_download
+                from unittest.mock import patch
+                import shutil
+                
+                CustomTqdm = self._create_tqdm_class(task)
+                
+                try:
+                    with patch('huggingface_hub.utils._tqdm.tqdm', CustomTqdm):
+                        cached_path = hf_hub_download(
+                            repo_id=repo_id,
+                            filename=filename_in_repo,
+                            revision=revision,
+                            token=hf_token if hf_token else None
+                        )
+                        # Hub download completed successfully
+                        shutil.copyfile(cached_path, task.temp_path)
+                        task.downloaded_bytes = os.path.getsize(task.temp_path)
+                        task.total_bytes = task.downloaded_bytes
+                        task.percentage = 100.0
+                        
+                        # Use the same verification and rename logic below
+                        self._finish_success(task)
+                        return
+                except ModuleNotFoundError:
+                    task.status = "failed"
+                    task.error_message = "huggingface_hub is not installed. Please restart ComfyUI or run: pip install huggingface-hub"
+                    self._notify_progress(task)
+                    print("[ModelDownloader] Missing huggingface_hub dependency.")
+                    return
+                except KeyboardInterrupt as e:
+                    if task.cancel_requested:
+                        self._finish_cancelled(task)
+                    elif task.is_paused:
+                        task.status = "paused"
+                        self._notify_progress(task)
+                    return
+                except Exception as e:
+                    task.status = "failed"
+                    task.error_message = f"HuggingFace Hub Error: {e}"
+                    self._notify_progress(task)
+                    print(f"[ModelDownloader] HF Download failed: {e}")
+                    return
 
-        # Determine existing size for resuming
+        # 2. Fallback for Civitai / Others using requests
         existing_size = 0
         if os.path.exists(task.temp_path):
             existing_size = os.path.getsize(task.temp_path)
@@ -373,47 +477,37 @@ class DownloadManager:
             "User-Agent": "ComfyUI-MissingModelDownloader"
         }
 
-        # Attach token if appropriate (exact-host match only, never a substring match,
-        # so a look-alike domain can't trick us into leaking the bearer token)
-        parsed_url = urllib.parse.urlparse(task.url)
-        if host_matches(parsed_url.netloc, "huggingface.co"):
-            hf_token = config_manager.get_hf_token()
-            if hf_token:
-                headers["Authorization"] = f"Bearer {hf_token}"
-        elif host_matches(parsed_url.netloc, "civitai.com"):
+        if host_matches(parsed_url.netloc, "civitai.com"):
             civitai_token = config_manager.get_civitai_token()
             if civitai_token and "token=" not in task.url:
                 headers["Authorization"] = f"Bearer {civitai_token}"
 
-        # Resume support
         if existing_size > 0:
             headers["Range"] = f"bytes={existing_size}-"
 
-        opener = urllib.request.build_opener(SafeRedirectHandler())
-        req = urllib.request.Request(task.url, headers=headers)
-
+        import requests
         try:
-            with opener.open(req, timeout=30) as resp:
-                status_code = getattr(resp, "status", 200)
+            with requests.get(task.url, headers=headers, stream=True, timeout=30) as resp:
+                resp.raise_for_status()
+                
+                status_code = resp.status_code
                 content_length = resp.headers.get("Content-Length")
                 
                 if status_code == 206:
-                    # Partial content (resumed)
                     task.total_bytes = existing_size + (int(content_length) if content_length else 0)
                     write_mode = "ab"
                 else:
-                    # Full content
                     task.total_bytes = int(content_length) if content_length else 0
                     task.downloaded_bytes = 0
                     write_mode = "wb"
 
-                chunk_size = 1024 * 1024  # 1MB chunks
+                chunk_size = 1024 * 1024
                 speed_window = []
                 last_calc_time = time.time()
                 last_bytes_recorded = task.downloaded_bytes
 
                 with open(task.temp_path, write_mode) as f:
-                    while True:
+                    for chunk in resp.iter_content(chunk_size=chunk_size):
                         if task.cancel_requested:
                             f.close()
                             self._finish_cancelled(task)
@@ -424,94 +518,83 @@ class DownloadManager:
                             self._notify_progress(task)
                             return
 
-                        chunk = resp.read(chunk_size)
-                        if not chunk:
-                            break
+                        if chunk:
+                            f.write(chunk)
+                            task.downloaded_bytes += len(chunk)
 
-                        f.write(chunk)
-                        task.downloaded_bytes += len(chunk)
+                            now = time.time()
+                            time_delta = now - last_calc_time
+                            if time_delta >= 0.5:
+                                bytes_delta = task.downloaded_bytes - last_bytes_recorded
+                                instant_speed = bytes_delta / time_delta
+                                speed_window.append(instant_speed)
+                                if len(speed_window) > 5:
+                                    speed_window.pop(0)
 
-                        now = time.time()
-                        time_delta = now - last_calc_time
-                        if time_delta >= 0.5:
-                            bytes_delta = task.downloaded_bytes - last_bytes_recorded
-                            instant_speed = bytes_delta / time_delta
-                            speed_window.append(instant_speed)
-                            if len(speed_window) > 5:
-                                speed_window.pop(0)
+                                task.speed_bytes_per_sec = sum(speed_window) / len(speed_window)
+                                if task.total_bytes > 0:
+                                    task.percentage = (task.downloaded_bytes / task.total_bytes) * 100
+                                    remaining_bytes = max(0, task.total_bytes - task.downloaded_bytes)
+                                    if task.speed_bytes_per_sec > 0:
+                                        task.eta_seconds = remaining_bytes / task.speed_bytes_per_sec
+                                    else:
+                                        task.eta_seconds = 0
 
-                            task.speed_bytes_per_sec = sum(speed_window) / len(speed_window)
-                            if task.total_bytes > 0:
-                                task.percentage = (task.downloaded_bytes / task.total_bytes) * 100
-                                remaining_bytes = max(0, task.total_bytes - task.downloaded_bytes)
-                                if task.speed_bytes_per_sec > 0:
-                                    task.eta_seconds = remaining_bytes / task.speed_bytes_per_sec
-                                else:
-                                    task.eta_seconds = 0
+                                last_calc_time = now
+                                last_bytes_recorded = task.downloaded_bytes
+                                self._notify_progress(task)
+            
+            # Successfully downloaded all chunks
+            self._finish_success(task)
 
-                            last_calc_time = now
-                            last_bytes_recorded = task.downloaded_bytes
-                            self._notify_progress(task)
-
-            if task.cancel_requested:
-                self._finish_cancelled(task)
-                return
-            if task.is_paused:
-                task.status = "paused"
-                self._notify_progress(task)
-                return
-
-            if task.expected_sha256:
-                import hashlib
-                task.status = "verifying"
-                self._notify_progress(task)
-                sha256_hash = hashlib.sha256()
-                try:
-                    with open(task.temp_path, "rb") as f:
-                        for byte_block in iter(lambda: f.read(4096), b""):
-                            sha256_hash.update(byte_block)
-                    actual_sha256 = sha256_hash.hexdigest().lower()
-                    if actual_sha256 != task.expected_sha256.lower():
-                        task.status = "failed"
-                        task.error_message = f"SHA256 mismatch. Expected: {task.expected_sha256}, got: {actual_sha256}"
-                        self._notify_progress(task)
-                        print(f"[ModelDownloader] Download failed: {task.error_message}")
-                        os.remove(task.temp_path)
-                        return
-                except Exception as e:
-                    task.status = "failed"
-                    task.error_message = f"Failed to verify SHA256: {e}"
-                    self._notify_progress(task)
-                    print(f"[ModelDownloader] Hash verification failed: {e}")
-                    return
-
-            # Rename temp file to destination
-            if os.path.exists(task.target_path):
-                os.remove(task.target_path)
-            os.rename(task.temp_path, task.target_path)
-
-            task.status = "completed"
-            task.percentage = 100.0
-            task.speed_bytes_per_sec = 0
-            task.eta_seconds = 0
-            self._notify_progress(task)
-            self._notify_completion(task)
-            print(f"[ModelDownloader] Successfully downloaded: {task.filename} to {task.target_path}")
-            self.save_state()
-
-        except urllib.error.HTTPError as e:
+        except requests.exceptions.RequestException as e:
             task.status = "failed"
-            task.error_message = f"HTTP Error {e.code}: {e.reason}"
-            if e.code in (401, 403):
-                task.error_message += " (Authentication or gated access required. Check your API token)."
+            task.error_message = f"Network Error: {e}"
             self._notify_progress(task)
-            print(f"[ModelDownloader] Download failed: {task.error_message}")
-            self.save_state()
+            print(f"[ModelDownloader] Request failed: {e}")
         except Exception as e:
             task.status = "failed"
             task.error_message = str(e)
             self._notify_progress(task)
             print(f"[ModelDownloader] Download exception: {e}")
-            self.save_state()
+
+    def _finish_success(self, task: DownloadTask):
+        # Verification
+        if task.expected_sha256:
+            import hashlib
+            task.status = "verifying"
+            self._notify_progress(task)
+            sha256_hash = hashlib.sha256()
+            try:
+                with open(task.temp_path, "rb") as f:
+                    for byte_block in iter(lambda: f.read(4096), b""):
+                        sha256_hash.update(byte_block)
+                actual_sha256 = sha256_hash.hexdigest().lower()
+                if actual_sha256 != task.expected_sha256.lower():
+                    task.status = "failed"
+                    task.error_message = f"SHA256 mismatch. Expected: {task.expected_sha256}, got: {actual_sha256}"
+                    self._notify_progress(task)
+                    print(f"[ModelDownloader] Download failed: {task.error_message}")
+                    os.remove(task.temp_path)
+                    return
+            except Exception as e:
+                task.status = "failed"
+                task.error_message = f"Failed to verify SHA256: {e}"
+                self._notify_progress(task)
+                print(f"[ModelDownloader] Hash verification failed: {e}")
+                return
+
+        # Rename temp file to destination
+        if os.path.exists(task.target_path):
+            os.remove(task.target_path)
+        os.rename(task.temp_path, task.target_path)
+
+        task.status = "completed"
+        task.percentage = 100.0
+        task.speed_bytes_per_sec = 0
+        task.eta_seconds = 0
+        self._notify_progress(task)
+        self._notify_completion(task)
+        print(f"[ModelDownloader] Successfully downloaded: {task.filename} to {task.target_path}")
 
 download_manager = DownloadManager()
