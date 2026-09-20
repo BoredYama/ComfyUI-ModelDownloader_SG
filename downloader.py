@@ -362,30 +362,42 @@ class DownloadManager:
         import time
         parent = self
         
+        shared_state = {
+            "instances": [],
+            "last_calc_time": time.time(),
+            "last_total_bytes": 0,
+            "speed_window": []
+        }
+        
         class CustomTqdm(huggingface_hub.utils.tqdm):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
-                self._last_calc_time = time.time()
-                self._last_bytes = self.n
-                self._speed_window = []
+                shared_state["instances"].append(self)
 
             def update(self, n=1):
                 super().update(n)
-                task.downloaded_bytes = self.n
-                task.total_bytes = self.total or 0
+                
+                current_total_n = max((getattr(inst, 'n', 0) for inst in shared_state["instances"]), default=0)
+                current_total_bytes = max((getattr(inst, 'total', 0) or 0 for inst in shared_state["instances"]), default=0)
+                
+                task.downloaded_bytes = current_total_n
+                task.total_bytes = current_total_bytes
                 if task.total_bytes > 0:
                     task.percentage = (task.downloaded_bytes / task.total_bytes) * 100
                 
                 now = time.time()
-                time_delta = now - self._last_calc_time
+                time_delta = now - shared_state["last_calc_time"]
+                
                 if time_delta >= 0.5:
-                    bytes_delta = self.n - self._last_bytes
+                    bytes_delta = current_total_n - shared_state["last_total_bytes"]
                     instant_speed = bytes_delta / time_delta
-                    self._speed_window.append(instant_speed)
-                    if len(self._speed_window) > 5:
-                        self._speed_window.pop(0)
+                    
+                    shared_state["speed_window"].append(instant_speed)
+                    if len(shared_state["speed_window"]) > 5:
+                        shared_state["speed_window"].pop(0)
 
-                    task.speed_bytes_per_sec = sum(self._speed_window) / len(self._speed_window)
+                    task.speed_bytes_per_sec = sum(shared_state["speed_window"]) / len(shared_state["speed_window"])
+                    
                     if task.total_bytes > 0:
                         remaining_bytes = max(0, task.total_bytes - task.downloaded_bytes)
                         if task.speed_bytes_per_sec > 0:
@@ -393,8 +405,9 @@ class DownloadManager:
                         else:
                             task.eta_seconds = 0
 
-                    self._last_calc_time = now
-                    self._last_bytes = self.n
+                    shared_state["last_calc_time"] = now
+                    shared_state["last_total_bytes"] = current_total_n
+                    
                     parent._notify_progress(task)
 
                 if task.cancel_requested:
