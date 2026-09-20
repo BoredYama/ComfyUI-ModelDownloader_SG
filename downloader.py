@@ -373,8 +373,13 @@ class DownloadManager:
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 shared_state["instances"].append(self)
+                if not hasattr(self, 'n'):
+                    self.n = 0
 
             def update(self, n=1):
+                if not hasattr(self, 'n'):
+                    self.n = 0
+                self.n += n
                 super().update(n)
                 
                 current_total_n = max((getattr(inst, 'n', 0) for inst in shared_state["instances"]), default=0)
