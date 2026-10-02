@@ -7,7 +7,6 @@ import threading
 import urllib.parse
 from config_manager import config_manager
 from detector import is_safe_folder_name
-from hf_client import hf_client
 
 # Handle ComfyUI imports if running inside ComfyUI
 try:
@@ -125,17 +124,6 @@ def check_disk_space(directory: str, needed_bytes: int):
         raise InsufficientDiskSpace(
             f"Not enough disk space: needs {format_size(needed_bytes)} (+{format_size(DISK_SPACE_MARGIN)} margin), {format_size(free)} free"
         )
-
-
-def dir_size(path: str) -> int:
-    total = 0
-    for root, _, files in os.walk(path):
-        for name in files:
-            try:
-                total += os.path.getsize(os.path.join(root, name))
-            except OSError:
-                pass
-    return total
 
 
 MAX_FINISHED_TASKS = 50  # cap retained completed/failed/cancelled tasks so history doesn't grow forever
@@ -388,8 +376,8 @@ class DownloadManager:
             except Exception:
                 pass
 
-    def _hf_temp_dir(self, task: DownloadTask) -> str:
-        """Per-task local_dir for hf_hub_download. Kept while paused so the partial download resumes."""
+    def _legacy_hf_temp_dir(self, task: DownloadTask) -> str:
+        """hf_hub_download scratch dir used before v1.2.1; only ever deleted now."""
         return os.path.join(os.path.dirname(task.temp_path), f".hf_tmp_{task.id}")
 
     def _remove_partial_files(self, task: DownloadTask):
@@ -398,7 +386,7 @@ class DownloadManager:
                 os.remove(task.temp_path)
         except OSError as e:
             print(f"[ModelDownloader] Failed to remove temp file: {e}")
-        shutil.rmtree(self._hf_temp_dir(task), ignore_errors=True)
+        shutil.rmtree(self._legacy_hf_temp_dir(task), ignore_errors=True)
 
     def _finish_cancelled(self, task: DownloadTask):
         """Marks a task cancelled and removes its partial files (explicit cancel = discard)."""
@@ -418,71 +406,6 @@ class DownloadManager:
         self._notify_progress(task)
         print(f"[ModelDownloader] Download failed ({task.filename}): {message}")
 
-    def _create_tqdm_class(self, task):
-        import huggingface_hub.utils
-        import time
-        parent = self
-        
-        shared_state = {
-            "instances": [],
-            "last_calc_time": time.time(),
-            "last_total_bytes": 0,
-            "speed_window": []
-        }
-        
-        class CustomTqdm(huggingface_hub.utils.tqdm):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, **kwargs)
-                shared_state["instances"].append(self)
-                if not hasattr(self, 'n'):
-                    self.n = 0
-
-            def update(self, n=1):
-                if not hasattr(self, 'n'):
-                    self.n = 0
-                self.n += n
-                super().update(n)
-                
-                current_total_n = max((getattr(inst, 'n', 0) for inst in shared_state["instances"]), default=0)
-                current_total_bytes = max((getattr(inst, 'total', 0) or 0 for inst in shared_state["instances"]), default=0)
-                
-                task.downloaded_bytes = current_total_n
-                task.total_bytes = current_total_bytes
-                if task.total_bytes > 0:
-                    task.percentage = (task.downloaded_bytes / task.total_bytes) * 100
-                
-                now = time.time()
-                time_delta = now - shared_state["last_calc_time"]
-                
-                if time_delta >= 0.5:
-                    bytes_delta = current_total_n - shared_state["last_total_bytes"]
-                    instant_speed = bytes_delta / time_delta
-                    
-                    shared_state["speed_window"].append(instant_speed)
-                    if len(shared_state["speed_window"]) > 5:
-                        shared_state["speed_window"].pop(0)
-
-                    task.speed_bytes_per_sec = sum(shared_state["speed_window"]) / len(shared_state["speed_window"])
-                    
-                    if task.total_bytes > 0:
-                        remaining_bytes = max(0, task.total_bytes - task.downloaded_bytes)
-                        if task.speed_bytes_per_sec > 0:
-                            task.eta_seconds = remaining_bytes / task.speed_bytes_per_sec
-                        else:
-                            task.eta_seconds = 0
-
-                    shared_state["last_calc_time"] = now
-                    shared_state["last_total_bytes"] = current_total_n
-                    
-                    parent._notify_progress(task)
-
-                if task.cancel_requested:
-                    raise KeyboardInterrupt("Cancelled by user")
-                if task.is_paused:
-                    raise KeyboardInterrupt("Paused by user")
-                    
-        return CustomTqdm
-
     def _download_worker(self, task: DownloadTask):
         task.status = "downloading"
         task.error_message = ""
@@ -490,64 +413,32 @@ class DownloadManager:
         task.last_update_time = time.time()
         self._notify_progress(task)
 
-        m = HF_URL_RE.search(task.url) if host_matches(urllib.parse.urlparse(task.url).netloc, "huggingface.co") else None
-        if m:
-            self._download_hf(task, m.group(1), m.group(2), urllib.parse.unquote(m.group(3)))
-        else:
-            self._download_http(task)
-
-    def _download_hf(self, task: DownloadTask, repo_id: str, revision: str, path_in_repo: str):
-        """Downloads through huggingface_hub (handles auth, xet/hf_transfer, and resume)."""
-        try:
-            from huggingface_hub import hf_hub_download
-            from unittest.mock import patch
-            CustomTqdm = self._create_tqdm_class(task)
-        except ModuleNotFoundError:
-            self._fail(task, "huggingface_hub is not installed. Please restart ComfyUI or run: pip install huggingface-hub")
-            return
-
-        hf_token = config_manager.get_hf_token() or None
-        temp_dir = self._hf_temp_dir(task)
-        try:
-            info = hf_client.get_file_info(repo_id, path_in_repo, revision, hf_token)
-            check_disk_space(os.path.dirname(task.temp_path), info.get("size_bytes", 0) - dir_size(temp_dir))
-
-            os.makedirs(temp_dir, exist_ok=True)
-            with patch('huggingface_hub.utils._tqdm.tqdm', CustomTqdm):
-                downloaded_path = hf_hub_download(
-                    repo_id=repo_id,
-                    filename=path_in_repo,
-                    revision=revision,
-                    local_dir=temp_dir,
-                    token=hf_token
-                )
-            # Move out of the temp dir (instant on the same drive), then verify and rename as usual
-            shutil.move(downloaded_path, task.temp_path)
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            task.downloaded_bytes = os.path.getsize(task.temp_path)
-            task.total_bytes = task.downloaded_bytes
-            task.percentage = 100.0
-            self._finish_success(task)
-        except KeyboardInterrupt:
-            # Raised from CustomTqdm.update on pause/cancel
-            if task.cancel_requested:
-                self._finish_cancelled(task)
-            elif task.is_paused:
-                self._finish_paused(task)
-        except InsufficientDiskSpace as e:
-            self._fail(task, str(e))
-        except Exception as e:
-            self._remove_partial_files(task)
-            self._fail(task, f"HuggingFace Hub Error: {e}")
+        # Partial data from the old hf_hub_download path can't be resumed by the HTTP path
+        shutil.rmtree(self._legacy_hf_temp_dir(task), ignore_errors=True)
+        self._download_http(task)
 
     def _download_http(self, task: DownloadTask):
-        """Streams Civitai / direct URLs with Range resume, retrying dropped connections."""
+        """Streams any URL (HF, Civitai, direct) with Range resume, retrying dropped connections.
+
+        HF files are fetched from their /resolve/ URL rather than through huggingface_hub: its Xet
+        backend runs progress callbacks in Rust and swallows the exception we'd use to pause/cancel.
+        """
         import requests
 
+        url = task.url
         headers = {"User-Agent": "ComfyUI-MissingModelDownloader"}
-        if host_matches(urllib.parse.urlparse(task.url).netloc, "civitai.com"):
+        netloc = urllib.parse.urlparse(url).netloc
+        if host_matches(netloc, "huggingface.co"):
+            # /blob/ URLs are the HTML file page; /resolve/ serves the file (redirecting to the CDN)
+            m = HF_URL_RE.search(url)
+            if m:
+                url = f"https://huggingface.co/{m.group(1)}/resolve/{m.group(2)}/{m.group(3)}"
+            hf_token = config_manager.get_hf_token()
+            if hf_token:
+                headers["Authorization"] = f"Bearer {hf_token}"
+        elif host_matches(netloc, "civitai.com"):
             civitai_token = config_manager.get_civitai_token()
-            if civitai_token and "token=" not in task.url:
+            if civitai_token and "token=" not in url:
                 headers["Authorization"] = f"Bearer {civitai_token}"
 
         retryable = (
@@ -560,7 +451,7 @@ class DownloadManager:
         while True:
             bytes_before = task.downloaded_bytes
             try:
-                outcome = self._http_attempt(task, headers)
+                outcome = self._http_attempt(task, url, headers)
                 if outcome == "done":
                     self._finish_success(task)
                 elif outcome == "cancelled":
@@ -589,6 +480,13 @@ class DownloadManager:
                 task.status = "downloading"
                 task.error_message = ""
                 self._notify_progress(task)
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code if e.response is not None else 0
+                if status in (401, 403) and host_matches(netloc, "huggingface.co"):
+                    self._fail(task, f"Access denied (HTTP {status}). The repo may be gated: accept its license on huggingface.co and set a Hugging Face token in settings.")
+                else:
+                    self._fail(task, f"Network Error: {e}")
+                return
             except requests.exceptions.RequestException as e:
                 self._fail(task, f"Network Error: {e}")
                 return
@@ -609,7 +507,7 @@ class DownloadManager:
             time.sleep(0.25)
         return True
 
-    def _http_attempt(self, task: DownloadTask, base_headers: dict) -> str:
+    def _http_attempt(self, task: DownloadTask, url: str, base_headers: dict) -> str:
         """One request, resuming from the partial file. Returns "done", "paused" or "cancelled"."""
         import requests
 
@@ -619,7 +517,7 @@ class DownloadManager:
         if existing_size > 0:
             headers["Range"] = f"bytes={existing_size}-"
 
-        with requests.get(task.url, headers=headers, stream=True, timeout=30) as resp:
+        with requests.get(url, headers=headers, stream=True, timeout=30) as resp:
             if resp.status_code == 416 and existing_size > 0:
                 # Range starts at/after the end: the partial file already holds the whole download
                 task.total_bytes = existing_size

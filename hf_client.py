@@ -9,6 +9,12 @@ from config_manager import config_manager
 HF_API_BASE = "https://huggingface.co/api"
 MODEL_EXTENSIONS = (".safetensors", ".gguf", ".ckpt", ".pt", ".bin", ".pth", ".onnx")
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Surfaces 3xx responses as HTTPError instead of following them."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class HuggingFaceClient:
     def __init__(self):
         pass
@@ -24,25 +30,42 @@ class HuggingFaceClient:
         return headers
 
     def get_file_info(self, repo_id: str, filename: str, revision: str = "main", token: str = None) -> dict:
-        """Sends a HEAD request to get exact file size and accessibility."""
+        """HEADs the resolve URL for the file's size and (for LFS/Xet files) SHA256.
+
+        Redirects are followed by hand: HF puts X-Linked-Size / X-Linked-Etag on its own 302 to the
+        CDN, and the CDN response that urllib would otherwise return doesn't carry them.
+        """
         resolve_url = f"https://huggingface.co/{repo_id}/resolve/{revision}/{urllib.parse.quote(filename)}"
         headers = self._get_headers(token)
-        req = urllib.request.Request(resolve_url, headers=headers, method="HEAD")
+        opener = urllib.request.build_opener(_NoRedirect)
+        url = resolve_url
         try:
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                size_str = resp.headers.get("Content-Length")
-                size_bytes = int(size_str) if size_str and size_str.isdigit() else 0
-                etag = resp.headers.get("X-Linked-Etag", "").strip('"')
-                sha256 = ""
-                if etag and len(etag) == 64:
-                    sha256 = etag
-                return {
-                    "accessible": True,
-                    "size_bytes": size_bytes,
-                    "sha256": sha256,
-                    "url": resolve_url,
-                    "status_code": resp.status
-                }
+            for _ in range(5):
+                req = urllib.request.Request(url, headers=headers, method="HEAD")
+                try:
+                    resp = opener.open(req, timeout=8)
+                except urllib.error.HTTPError as e:
+                    if e.code not in (301, 302, 303, 307, 308):
+                        raise
+                    resp = e
+                with resp:
+                    linked_size = resp.headers.get("X-Linked-Size", "")
+                    location = resp.headers.get("Location", "")
+                    # Relative redirects stay on huggingface.co (renamed repos, /api/resolve-cache/ for small files)
+                    if not linked_size and location.startswith("/"):
+                        url = urllib.parse.urljoin(url, location)
+                        continue
+                    size_str = linked_size or resp.headers.get("Content-Length", "")
+                    etag = (resp.headers.get("X-Linked-Etag") or "").strip('"')
+                    return {
+                        "accessible": True,
+                        "size_bytes": int(size_str) if size_str.isdigit() else 0,
+                        # LFS/Xet files report their SHA256 here; small git files only have a SHA1
+                        "sha256": etag.lower() if re.fullmatch(r"[0-9a-fA-F]{64}", etag) else "",
+                        "url": resolve_url,
+                        "status_code": resp.status
+                    }
+            raise urllib.error.URLError("too many redirects")
         except urllib.error.HTTPError as e:
             return {
                 "accessible": False,
@@ -418,6 +441,7 @@ class HuggingFaceClient:
             file_path = match.group(3)
             filename = file_path.split("/")[-1]
             download_url = f"https://huggingface.co/{repo_id}/resolve/{revision}/{urllib.parse.quote(file_path)}"
+            info = self.get_file_info(repo_id, urllib.parse.unquote(file_path), revision)
             return {
                 "source": "huggingface",
                 "valid": True,
@@ -426,7 +450,8 @@ class HuggingFaceClient:
                 "filename": filename,
                 "file_path": file_path,
                 "download_url": download_url,
-                "sha256": ""
+                "size_bytes": info.get("size_bytes", 0),
+                "sha256": info.get("sha256", "")
             }
 
         # Pattern 2: Model repo link without file

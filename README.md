@@ -95,8 +95,12 @@ The addon also registers a passthrough node called **"📦 Model Downloader (SG)
 - Python 3.9+
 - `aiohttp >= 3.8.0`
 - `requests >= 2.28.0`
-- `huggingface-hub[hf_transfer] >= 0.24.0`
-- `tqdm`
+
+## ✨ v1.2.1 Changes
+
+- **Hugging Face downloads fixed.** They failed every time with huggingface_hub 1.x. HF files now download over plain HTTP like everything else, so pause, resume, cancel and auto-retry work for them too. `huggingface-hub` and `tqdm` are no longer required.
+- **HF downloads are hash-checked.** The SHA256 (and exact size) for Hugging Face files was always coming back empty, so they were never verified. Search results and pasted HF links now carry it.
+- **Clear message for gated repos.** HTTP 401/403 from Hugging Face now explains how to get access.
 
 ## ✨ v1.2.0 Changes
 

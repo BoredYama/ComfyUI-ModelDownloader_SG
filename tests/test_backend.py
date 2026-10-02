@@ -130,6 +130,20 @@ def test_hf_client_search():
     else:
         print("ℹ Note: No results or network timeout on HF search.")
 
+def test_hf_file_info_reads_hash_before_cdn_redirect():
+    print("\n--- Testing HF File Info SHA256 (Live Network Query) ---")
+    # HF reports an LFS/Xet file's SHA256 and size only on its own 302, not on the CDN response
+    info = hf_client.get_file_info("sentence-transformers/all-MiniLM-L6-v2", "model.safetensors")
+    if not info["accessible"]:
+        print(f"ℹ Note: HF unreachable ({info.get('error')}), skipped.")
+        return
+    assert info["sha256"] == "53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db", info
+    assert info["size_bytes"] == 90868376, info
+    # Small git-stored files only have a SHA1, which must not be passed off as a SHA256
+    small = hf_client.get_file_info("openai-community/gpt2", "config.json")
+    assert small["accessible"] and small["sha256"] == "" and small["size_bytes"] > 0, small
+    print("✓ HF SHA256 and size read from the resolve redirect.")
+
 def test_civitai_client_url_parsing():
     print("\n--- Testing Civitai URL Parsing ---")
     url = "https://civitai.com/models/12345?modelVersionId=67890"
@@ -385,6 +399,7 @@ if __name__ == "__main__":
     test_config_manager()
     test_hf_client_url_parsing()
     test_hf_client_search()
+    test_hf_file_info_reads_hash_before_cdn_redirect()
     test_civitai_client_url_parsing()
     test_civitai_search()
     test_detector_graph_scanning()
