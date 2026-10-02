@@ -470,7 +470,11 @@ class MissingModelDownloaderUI {
                         exactText.title = exact.download_url;
                     } else {
                         const size = formatBytes(exact.size_bytes);
-                        exactText.textContent = size ? `Exact match found ✓ · ${size}` : "Exact match found ✓";
+                        // A "comfy_"-prefixed name can match a file without the prefix: show which file it is
+                        const renamed = exact.name && exact.name.toLowerCase() !== m.filename.toLowerCase();
+                        const label = renamed ? `Match found ✓ · ${exact.name}` : "Exact match found ✓";
+                        exactText.textContent = size ? `${label} · ${size}` : label;
+                        exactText.title = exact.repo_id ? `${exact.repo_id}/${exact.relative_path || exact.name}` : "";
                     }
                 }
                 if (quickDlBtn) {

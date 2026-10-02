@@ -166,6 +166,27 @@ def test_hf_search_scans_files_listed_by_search_api():
     assert not any("/api/models/someone/gemma-repo" in u for u in requested), "Listed siblings should be used without a detail fetch"
     print("✓ Repos returned with siblings are scanned for files.")
 
+def test_hf_comfy_prefix_match_only_exact_from_known_orgs():
+    print("\n--- Testing HF comfy_ Prefix Matches ---")
+    # comfy_gemma_3_12B_it.safetensors is Comfy-Org's gemma_3_12B_it.safetensors; a re-upload of that name isn't trusted
+    import io, json as _json
+    listing = [
+        {"id": "Comfy-Org/ltx-2", "siblings": [{"rfilename": "split_files/text_encoders/gemma_3_12B_it.safetensors"}]},
+        {"id": "someone/gemma-reupload", "siblings": [{"rfilename": "gemma_3_12B_it.safetensors"}]},
+    ]
+
+    def fake_urlopen(req, *args, **kwargs):
+        return io.BytesIO(_json.dumps(listing if "/api/models?search=" in req.full_url else []).encode())
+
+    with patch("hf_client.urllib.request.urlopen", fake_urlopen), \
+            patch.object(hf_client, "get_file_info", lambda *a, **k: {"size_bytes": 1, "sha256": ""}):
+        results = hf_client.search_for_model("comfy_gemma_3_12B_it.safetensors")
+    by_repo = {r["repo_id"]: r for r in results}
+    assert by_repo["Comfy-Org/ltx-2"]["exact_match"] is True, results
+    assert by_repo["someone/gemma-reupload"]["exact_match"] is False, results
+    assert results[0]["repo_id"] == "Comfy-Org/ltx-2", results
+    print("✓ comfy_ prefix matches are exact only from known publishers.")
+
 def test_civitai_client_url_parsing():
     print("\n--- Testing Civitai URL Parsing ---")
     url = "https://civitai.com/models/12345?modelVersionId=67890"
@@ -187,6 +208,33 @@ def test_civitai_search():
         print("✓ Civitai Search API successfully found model.")
     else:
         print("ℹ Note: No results or network timeout on Civitai search.")
+
+def test_detector_reads_v3_combo_inputs():
+    print("\n--- Testing Folder Inference for V3 Nodes ---")
+    # V3 (io.ComfyNode) nodes declare combos as ("COMBO", {"options": [...]}), not a bare list
+    import detector as detector_module
+
+    class FakeV3Node:
+        @staticmethod
+        def INPUT_TYPES():
+            return {"required": {"weights": ("COMBO", {"options": ["a.safetensors", "b.safetensors"]})}}
+
+    class FakeFolderPaths:
+        folder_names_and_paths = {"checkpoints": None, "text_encoders": None}
+        @staticmethod
+        def get_filename_list(f_type):
+            return ["a.safetensors", "b.safetensors"] if f_type == "text_encoders" else ["x.safetensors"]
+
+    class FakeNodes:
+        NODE_CLASS_MAPPINGS = {"SomeV3Loader": FakeV3Node}
+
+    with patch.object(detector_module, "HAS_NODES", True), patch.object(detector_module, "nodes", FakeNodes, create=True), \
+            patch.object(detector_module, "HAS_FOLDER_PATHS", True), patch.object(detector_module, "folder_paths", FakeFolderPaths, create=True):
+        assert detector.infer_folder_type("SomeV3Loader", "weights", "c.safetensors") == "text_encoders"
+    # Without node info, LTX-2's text encoder input still lands in text_encoders, not the checkpoints default
+    assert detector.infer_folder_type("LTXAVTextEncoderLoader", "text_encoder", "comfy_gemma_3_12B_it.safetensors") == "text_encoders"
+    assert detector.infer_folder_type("LTXAVTextEncoderLoader", "ckpt_name", "ltx-2.3-22b-dev.safetensors") == "checkpoints"
+    print("✓ V3 combo inputs and text encoder widgets map to the right folders.")
 
 def test_detector_graph_scanning():
     print("\n--- Testing Workflow Model Detector ---")
@@ -423,8 +471,10 @@ if __name__ == "__main__":
     test_hf_client_search()
     test_hf_file_info_reads_hash_before_cdn_redirect()
     test_hf_search_scans_files_listed_by_search_api()
+    test_hf_comfy_prefix_match_only_exact_from_known_orgs()
     test_civitai_client_url_parsing()
     test_civitai_search()
+    test_detector_reads_v3_combo_inputs()
     test_detector_graph_scanning()
     test_host_matches_rejects_lookalike_domains()
     test_redact_url_secrets()

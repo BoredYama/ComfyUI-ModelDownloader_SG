@@ -113,8 +113,9 @@ class HuggingFaceClient:
                 target_stem = target_stem[:-len(ext)]
                 break
         
-        # Same name once a "comfy_" style prefix is dropped: very likely the same file, but not certain
+        # Same name once a "comfy_" style prefix is dropped (comfy_gemma_3_12B_it -> gemma_3_12B_it)
         target_core = re.sub(r'^(?:%s)[-_.]+' % "|".join(GENERIC_NAME_WORDS), '', target_stem)
+        target_core_name = target_core + target_filename_lower[len(target_stem):]
         is_known_org = repo_id.split("/")[0].lower() in KNOWN_ORGS_LOWER
 
         # Build keyword set from the target filename for fuzzy matching
@@ -142,6 +143,10 @@ class HuggingFaceClient:
 
             # Check match relevance
             is_exact_match = (base_sibling_lower == target_filename_lower)
+            # Counted as exact only from a known publisher, so a re-upload can't get one-click download
+            is_prefix_match = target_core != target_stem and base_sibling_lower == target_core_name
+            if is_prefix_match and is_known_org:
+                is_exact_match = True
             
             # Substring match (on stems, not full filenames with extensions)
             is_partial_match = (
@@ -172,7 +177,7 @@ class HuggingFaceClient:
                 score = 0
                 if is_exact_match:
                     score += 100
-                elif target_core != target_stem and sibling_stem == target_core:
+                elif is_prefix_match:
                     score += 80
                 if is_known_org:
                     score += 30

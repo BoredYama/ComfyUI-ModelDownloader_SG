@@ -34,6 +34,8 @@ WIDGET_TO_FOLDER = {
     "embedding_name": "embeddings",
     "upscale_model_name": "upscale_models",
     "tiny_vae": "vae_approx",
+    "text_encoder": "text_encoders",
+    "text_encoder_name": "text_encoders",
 }
 
 # Known node type prefix/keyword -> folder type mapping
@@ -43,6 +45,7 @@ NODE_TYPE_TO_FOLDER = {
     "vae": "vae",
     "controlnet": "controlnet",
     "clipvision": "clip_vision",
+    "textencoder": "text_encoders",
     "clip": "clip",
     "unet": "unet",
     "diffusion": "diffusion_models",
@@ -187,8 +190,14 @@ class MissingModelDetector:
 
                     if widget_name in all_inputs:
                         spec = all_inputs[widget_name]
-                        if isinstance(spec, tuple) and len(spec) > 0 and isinstance(spec[0], list):
-                            choices = spec[0]
+                        choices = None
+                        if isinstance(spec, tuple) and len(spec) > 0:
+                            if isinstance(spec[0], list):
+                                choices = spec[0]
+                            # V3 (io.ComfyNode) combos: ("COMBO", {"options": [...]})
+                            elif spec[0] == "COMBO" and len(spec) > 1 and isinstance(spec[1], dict):
+                                choices = spec[1].get("options")
+                        if isinstance(choices, list):
                             # Check which folder's filename list matches these choices exactly
                             # ONLY if choices is not empty. If it's empty, we can't uniquely match it.
                             if HAS_FOLDER_PATHS and len(choices) > 0:
