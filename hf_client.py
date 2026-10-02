@@ -9,6 +9,18 @@ from config_manager import config_manager
 HF_API_BASE = "https://huggingface.co/api"
 MODEL_EXTENSIONS = (".safetensors", ".gguf", ".ckpt", ".pt", ".bin", ".pth", ".onnx")
 
+# Publishers searched as a fallback; their files also rank above re-uploads of the same name
+KNOWN_ORGS = [
+    "Comfy-Org", "Kijai", "city96", "lllyasviel",
+    "black-forest-labs", "stabilityai", "mcmonkey",
+    "RunDiffusion", "cocktailpeanut", "ByteDance",
+    "lightx2v", "bartowski", "mradermacher", "Lightricks", "joeygambino", "LootingGod"
+]
+KNOWN_ORGS_LOWER = {o.lower() for o in KNOWN_ORGS}
+
+# Words that say where a file is used rather than what it is (comfy_gemma_3_12B_it -> gemma_3_12B_it)
+GENERIC_NAME_WORDS = ("comfy", "comfyui")
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Surfaces 3xx responses as HTTPError instead of following them."""
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -101,6 +113,10 @@ class HuggingFaceClient:
                 target_stem = target_stem[:-len(ext)]
                 break
         
+        # Same name once a "comfy_" style prefix is dropped: very likely the same file, but not certain
+        target_core = re.sub(r'^(?:%s)[-_.]+' % "|".join(GENERIC_NAME_WORDS), '', target_stem)
+        is_known_org = repo_id.split("/")[0].lower() in KNOWN_ORGS_LOWER
+
         # Build keyword set from the target filename for fuzzy matching
         target_keywords = set(re.split(r'[-_.\s]+', target_stem))
         target_keywords = {k for k in target_keywords if len(k) >= 2}
@@ -156,6 +172,10 @@ class HuggingFaceClient:
                 score = 0
                 if is_exact_match:
                     score += 100
+                elif target_core != target_stem and sibling_stem == target_core:
+                    score += 80
+                if is_known_org:
+                    score += 30
                 if clean_query.lower() in sibling_stem:
                     score += 20
                 elif sibling_stem in target_stem or target_stem in sibling_stem:
@@ -225,14 +245,11 @@ class HuggingFaceClient:
             "svi": "wanvideo"
         }
         
-        fallback_kw = keywords[0] if keywords else clean_query
         for k in list(keywords):
             for syn_k, syn_v in SYNONYMS.items():
                 if syn_k in k.lower():
                     if syn_v not in [x.lower() for x in keywords]:
                         keywords.append(syn_v)
-                    if fallback_kw.lower() == k.lower():
-                        fallback_kw = syn_v
 
         primary_keyword = keywords[0] if keywords else clean_query
         
@@ -248,6 +265,16 @@ class HuggingFaceClient:
         version_expanded_query = expand_versions(clean_query)
 
         results = []
+        parsed_ids = set()
+
+        def parse_repo(repo_detail):
+            """Scans a repo's file list once, however many searches returned it."""
+            repo_id = repo_detail.get("id")
+            if repo_id in parsed_ids:
+                return
+            parsed_ids.add(repo_id)
+            self._parse_repo_detail(repo_detail, raw_query, clean_query, results)
+
         token = config_manager.get_hf_token()
         headers = self._get_headers(token)
 
@@ -330,7 +357,7 @@ class HuggingFaceClient:
                                 matched_repos.append(er)
                                 # These repos came with full=true so they have siblings already
                                 # Parse them immediately for file matches
-                                self._parse_repo_detail(er, raw_query, clean_query, results)
+                                parse_repo(er)
                 except Exception:
                     pass
 
@@ -347,15 +374,18 @@ class HuggingFaceClient:
             repo_id = repo_info.get("id")
             if not repo_id:
                 continue
-            # Skip repos already parsed with full=true (they have siblings data)
+            if repo_id in parsed_ids:
+                continue
+            # The search API lists files (siblings) even without full=true; fetch details only when it didn't
             if repo_info.get("siblings"):
+                parse_repo(repo_info)
                 continue
             try:
                 detail_url = f"{HF_API_BASE}/models/{repo_id}"
                 req = urllib.request.Request(detail_url, headers=headers)
                 with urllib.request.urlopen(req, timeout=8) as resp:
                     repo_detail = json.loads(resp.read().decode("utf-8"))
-                self._parse_repo_detail(repo_detail, raw_query, clean_query, results)
+                parse_repo(repo_detail)
             except Exception as e:
                 if "401" in str(e) or "403" in str(e):
                     results.append({
@@ -374,22 +404,21 @@ class HuggingFaceClient:
 
         # 3. Fallback for ComfyUI orgs if no exact match is found
         if not any(r["exact_match"] for r in results):
-            KNOWN_ORGS = [
-                "Comfy-Org", "Kijai", "city96", "lllyasviel", 
-                "black-forest-labs", "stabilityai", "mcmonkey", 
-                "RunDiffusion", "cocktailpeanut", "ByteDance",
-                "lightx2v", "bartowski", "mradermacher", "Lightricks", "joeygambino", "LootingGod"
-            ]
-            
-            # Better fallback keyword that doesn't split version numbers (e.g. wan2.2)
-            fallback_kw = re.split(r'[-_\s]+', clean_query)[0] if clean_query else ""
+            # First real word of the name (not split on dots, so wan2.2 survives), skipping "comfy" etc.,
+            # plus its ecosystem synonym: gemma -> ltx finds Comfy-Org/ltx-2, whose name lacks "gemma"
+            name_words = [w for w in re.split(r'[-_\s]+', clean_query) if w and w.lower() not in GENERIC_NAME_WORDS]
+            fallback_kws = name_words[:1]
+            for syn_k, syn_v in SYNONYMS.items():
+                if name_words and syn_k in name_words[0].lower() and syn_v not in fallback_kws:
+                    fallback_kws.append(syn_v)
+                    break
             
             def fetch_org(org):
                 org_results = []
-                url1 = f"{HF_API_BASE}/models?author={org}&search={urllib.parse.quote(fallback_kw)}&limit=10&full=true"
-                url2 = f"{HF_API_BASE}/models?author={org}&sort=downloads&limit=10&full=true"
+                urls = [f"{HF_API_BASE}/models?author={org}&search={urllib.parse.quote(kw)}&limit=10&full=true" for kw in fallback_kws]
+                urls.append(f"{HF_API_BASE}/models?author={org}&sort=downloads&limit=10&full=true")
                 repos = []
-                for url in [url1, url2]:
+                for url in urls:
                     try:
                         req = urllib.request.Request(url, headers=headers)
                         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -405,7 +434,7 @@ class HuggingFaceClient:
                     org_repos.extend(future.result())
                     
             for repo_detail in org_repos:
-                self._parse_repo_detail(repo_detail, raw_query, clean_query, results)
+                parse_repo(repo_detail)
 
         # 4. Concurrently fetch exact file sizes for Hugging Face results
         def fetch_size(r):

@@ -144,6 +144,28 @@ def test_hf_file_info_reads_hash_before_cdn_redirect():
     assert small["accessible"] and small["sha256"] == "" and small["size_bytes"] > 0, small
     print("✓ HF SHA256 and size read from the resolve redirect.")
 
+def test_hf_search_scans_files_listed_by_search_api():
+    print("\n--- Testing HF Search Uses Listed Siblings ---")
+    # The HF search API lists files (siblings) even with full=false; those repos must still be scanned
+    import io, json as _json
+    listing = [{"id": "someone/gemma-repo", "downloads": 0, "likes": 0,
+                "siblings": [{"rfilename": "text_encoders/gemma_3_12B_it.safetensors"}]}]
+    requested = []
+
+    def fake_urlopen(req, *args, **kwargs):
+        url = req.full_url
+        requested.append(url)
+        body = _json.dumps(listing if "/api/models?search=" in url else []).encode()
+        return io.BytesIO(body)
+
+    with patch("hf_client.urllib.request.urlopen", fake_urlopen), \
+            patch.object(hf_client, "get_file_info", lambda *a, **k: {"size_bytes": 1, "sha256": ""}):
+        results = hf_client.search_for_model("gemma_3_12B_it.safetensors")
+    exact = [r for r in results if r["exact_match"]]
+    assert exact and exact[0]["repo_id"] == "someone/gemma-repo", results
+    assert not any("/api/models/someone/gemma-repo" in u for u in requested), "Listed siblings should be used without a detail fetch"
+    print("✓ Repos returned with siblings are scanned for files.")
+
 def test_civitai_client_url_parsing():
     print("\n--- Testing Civitai URL Parsing ---")
     url = "https://civitai.com/models/12345?modelVersionId=67890"
@@ -400,6 +422,7 @@ if __name__ == "__main__":
     test_hf_client_url_parsing()
     test_hf_client_search()
     test_hf_file_info_reads_hash_before_cdn_redirect()
+    test_hf_search_scans_files_listed_by_search_api()
     test_civitai_client_url_parsing()
     test_civitai_search()
     test_detector_graph_scanning()

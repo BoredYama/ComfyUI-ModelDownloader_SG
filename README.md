@@ -100,6 +100,7 @@ The addon also registers a passthrough node called **"📦 Model Downloader (SG)
 
 - **Hugging Face downloads fixed.** They failed every time with huggingface_hub 1.x. HF files now download over plain HTTP like everything else, so pause, resume, cancel and auto-retry work for them too. `huggingface-hub` and `tqdm` are no longer required.
 - **HF downloads are hash-checked.** The SHA256 (and exact size) for Hugging Face files was always coming back empty, so they were never verified. Search results and pasted HF links now carry it.
+- **Hugging Face search fixed.** Repos found by the main search were silently skipped (HF's API changed what it returns), so many files were never found. Official publishers (Comfy-Org, Kijai, Lightricks…) now rank above re-uploads, and names with a `comfy_` prefix also match the file without it (e.g. `comfy_gemma_3_12B_it` → `Comfy-Org/ltx-2`'s `gemma_3_12B_it`).
 - **Clear message for gated repos.** HTTP 401/403 from Hugging Face now explains how to get access.
 
 ## ✨ v1.2.0 Changes
