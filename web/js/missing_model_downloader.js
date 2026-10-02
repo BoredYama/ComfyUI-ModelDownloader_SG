@@ -8,12 +8,26 @@ cssLink.type = "text/css";
 cssLink.href = new URL("style.css", import.meta.url).href;
 document.head.appendChild(cssLink);
 
-// Sorted folder list for dropdowns
+// Fallback folder list, used until the registered folders are fetched from ComfyUI
 const SORTED_FOLDERS = [
     "checkpoints", "clip", "clip_vision", "controlnet",
     "diffusion_models", "embeddings", "loras",
     "upscale_models", "vae"
 ];
+
+// Sentinel <option> value that prompts for a custom folder name under models/
+const CUSTOM_FOLDER_VALUE = "__mmd_custom_folder__";
+const CUSTOM_FOLDER_RE = /^[A-Za-z0-9_\-][A-Za-z0-9_.\- ]*$/;
+
+// Download states during which a card should keep showing "Downloading..."
+const IN_PROGRESS_STATUSES = ["pending", "queued", "downloading", "retrying", "paused", "verifying"];
+
+function formatBytes(bytes) {
+    if (!bytes || bytes <= 0) return "";
+    const gb = bytes / (1024 ** 3);
+    if (gb >= 1) return `${gb.toFixed(2)} GB`;
+    return `${(bytes / (1024 ** 2)).toFixed(1)} MB`;
+}
 
 // Escapes text before it's interpolated into an innerHTML template. Model filenames, node
 // types, and search-result metadata all originate from workflow files or third-party APIs,
@@ -30,6 +44,10 @@ class MissingModelDownloaderUI {
         this.missingModels = [];
         this.activeDownloads = {};
         this.searchCache = {};
+        this.folders = [...SORTED_FOLDERS];
+        this.expandedResults = new Set();  // filenames whose search results the user has open
+        this.pendingRescan = false;
+        this.nodeBindings = {};  // task_id -> node widget to repoint once a differently named file finishes
         this.config = {
             has_hf_token: false,
             hf_token_masked: "",
@@ -46,6 +64,7 @@ class MissingModelDownloaderUI {
 
     async init() {
         await this.loadConfig();
+        await this.loadFolders();
         this.createTopbarButton();
         this.createModal();
         this.setupWebSocketListeners();
@@ -64,6 +83,19 @@ class MissingModelDownloaderUI {
             }
         } catch (e) {
             console.error("[ModelDownloader] Failed to load config:", e);
+        }
+    }
+
+    async loadFolders() {
+        try {
+            const resp = await api.fetchApi("/model_downloader/folders");
+            if (resp.ok) {
+                const data = await resp.json();
+                const names = Object.keys(data.folders || {});
+                if (names.length > 0) this.folders = names;
+            }
+        } catch (e) {
+            console.error("[ModelDownloader] Failed to load folders:", e);
         }
     }
 
@@ -200,9 +232,48 @@ class MissingModelDownloaderUI {
                 if (app.refreshObjectInfo) {
                     await app.refreshObjectInfo();
                 }
+                const binding = this.nodeBindings[task.id];
+                delete this.nodeBindings[task.id];
+                if (binding) {
+                    this.showBanner(`Use "${binding.newValue}" in ${binding.nodeType}?`, "Update", () => this.applyNodeBinding(binding), 30000);
+                }
                 setTimeout(() => this.scanWorkflow(false), 500);
             }
         });
+    }
+
+    /** Points a workflow node's model widget at a downloaded file whose name differs from the original. */
+    applyNodeBinding(binding) {
+        const node = app.graph ? app.graph.getNodeById(binding.nodeId) : null;
+        const widget = node && node.widgets
+            ? (node.widgets.find(w => w.name === binding.widgetName) || node.widgets.find(w => w.value === binding.oldValue))
+            : null;
+        if (!widget) {
+            // e.g. nodes inside subgraphs, whose ids ("12:5") aren't on the root graph
+            this.showToast(`Couldn't find the ${binding.nodeType} node. Select "${binding.newValue}" on it manually.`, true);
+            return;
+        }
+        widget.value = binding.newValue;
+        if (widget.callback) widget.callback(binding.newValue);
+        app.graph.setDirtyCanvas(true, true);
+        this.showToast(`${binding.nodeType} now uses ${binding.newValue}`);
+        setTimeout(() => this.scanWorkflow(false), 300);
+    }
+
+    /** A download for a missing model card: where it goes and, if renamed, which node widget to repoint. */
+    cardDownloadOptions(model, savedName, sha256 = "") {
+        const opts = { sha256, subfolder: model.subfolder || "" };
+        if (savedName !== model.filename) {
+            const sep = (model.original_value || "").includes("\\") ? "\\" : "/";
+            opts.binding = {
+                nodeId: model.node_id,
+                nodeType: model.node_type,
+                widgetName: model.widget_name,
+                oldValue: model.original_value,
+                newValue: opts.subfolder ? opts.subfolder.split("/").join(sep) + sep + savedName : savedName
+            };
+        }
+        return opts;
     }
 
     setupWorkflowHooks() {
@@ -219,7 +290,11 @@ class MissingModelDownloaderUI {
     }
 
     async scanWorkflow(notifyUser = false) {
-        if (this.isScanning) return;
+        if (this.isScanning) {
+            // A download finished mid-scan; rescan afterwards so the list reflects it
+            this.pendingRescan = true;
+            return;
+        }
         this.isScanning = true;
 
         try {
@@ -283,7 +358,7 @@ class MissingModelDownloaderUI {
                 }
 
                 this.missingModels.forEach((m, index) => {
-                    if (!this.searchCache[m.filename]) {
+                    if (!m.known_url && !this.searchCache[m.filename]) {
                         this.prefetchSearch(m.filename, m.folder_type, index);
                     }
                 });
@@ -292,6 +367,10 @@ class MissingModelDownloaderUI {
             console.error("[ModelDownloader] Error scanning workflow:", e);
         } finally {
             this.isScanning = false;
+            if (this.pendingRescan) {
+                this.pendingRescan = false;
+                setTimeout(() => this.scanWorkflow(false), 0);
+            }
         }
     }
 
@@ -335,44 +414,74 @@ class MissingModelDownloaderUI {
         }
     }
 
+    /** Returns the in-flight download task for a filename, if any. */
+    findActiveDownload(filename) {
+        return Object.values(this.activeDownloads).find(t =>
+            t.filename === filename && IN_PROGRESS_STATUSES.includes(t.status)
+        );
+    }
+
+    /** Marks a missing-model card as downloading (also used to restore that state after a re-render). */
+    markCardDownloading(card) {
+        if (!card) return;
+        card.style.borderColor = "var(--mmd-success)";
+        card.style.backgroundColor = "rgba(76, 175, 80, 0.05)";
+        const qBtn = card.querySelector(".mmd-quick-dl-btn");
+        if (qBtn) {
+            qBtn.textContent = "Downloading...";
+            qBtn.style.backgroundColor = "var(--mmd-success)";
+            qBtn.disabled = true;
+        }
+    }
+
     checkExactMatches() {
         const exactMatches = [];
         this.missingModels.forEach((m, index) => {
+            // Search results don't go stale within a session, so exact matches survive rescans
+            // (e.g. after another download completes) no matter how long that took.
             const cache = this.searchCache[m.filename];
-            
+
             const card = this.modal ? this.modal.querySelector(`#mmd-missing-card-${index}`) : null;
             const metaDiv = card ? card.querySelector('.mmd-model-meta') : null;
             const quickDlBtn = card ? card.querySelector('.mmd-quick-dl-btn') : null;
+            const folderSelect = card ? card.querySelector('.mmd-folder-select') : null;
             let exactText = metaDiv ? metaDiv.querySelector('.mmd-exact-match-text') : null;
 
-            if (cache && Date.now() - cache.time < 300000) {
-                const exact = cache.results.find(r => r.exact_match);
-                if (exact) {
-                    exactMatches.push({ model: m, exactResult: exact, folderType: cache.folderType });
-                    if (metaDiv && !exactText) {
-                        exactText = document.createElement("span");
-                        exactText.className = "mmd-exact-match-text";
-                        exactText.style.cssText = "color: var(--mmd-success); font-weight: 600; font-size: 11px; margin-left: 6px;";
-                        exactText.textContent = "Exact match found ✓";
-                        metaDiv.appendChild(exactText);
+            const exact = m.known_url
+                ? { download_url: m.known_url, sha256: m.known_sha256, size_bytes: 0, from_workflow: true }
+                : (cache ? cache.results.find(r => r.exact_match) : null);
+            if (exact) {
+                const getFolder = () => (folderSelect ? folderSelect.value : m.folder_type);
+                const isDownloading = !!this.findActiveDownload(m.filename);
+                if (!isDownloading) {
+                    exactMatches.push({ model: m, exactResult: exact, getFolder });
+                }
+                if (metaDiv && !exactText) {
+                    exactText = document.createElement("span");
+                    exactText.className = "mmd-exact-match-text";
+                    exactText.style.cssText = "color: var(--mmd-success); font-weight: 600; font-size: 11px; margin-left: 6px;";
+                    metaDiv.appendChild(exactText);
+                }
+                if (exactText) {
+                    if (exact.from_workflow) {
+                        let host = "";
+                        try { host = new URL(exact.download_url).host; } catch (e) {}
+                        exactText.textContent = `URL from workflow ✓ · ${host}`;
+                        exactText.title = exact.download_url;
+                    } else {
+                        const size = formatBytes(exact.size_bytes);
+                        exactText.textContent = size ? `Exact match found ✓ · ${size}` : "Exact match found ✓";
                     }
-                    if (quickDlBtn) {
-                        quickDlBtn.style.display = "inline-block";
-                        quickDlBtn.onclick = () => {
-                            this.startDownload(exact.download_url, m.filename, cache.folderType, "", false, exact.sha256, () => {
-                                quickDlBtn.textContent = "Downloading...";
-                                quickDlBtn.style.backgroundColor = "var(--mmd-success)";
-                                quickDlBtn.disabled = true;
-                                if (card) {
-                                    card.style.borderColor = "var(--mmd-success)";
-                                    card.style.backgroundColor = "rgba(76, 175, 80, 0.05)";
-                                }
-                            });
-                        };
-                    }
-                } else {
-                    if (exactText) exactText.remove();
-                    if (quickDlBtn) quickDlBtn.style.display = "none";
+                }
+                if (quickDlBtn) {
+                    quickDlBtn.style.display = "inline-block";
+                    quickDlBtn.onclick = () => {
+                        this.startDownload(exact.download_url, m.filename, getFolder(), {
+                            ...this.cardDownloadOptions(m, m.filename, exact.sha256),
+                            onStarted: () => this.markCardDownloading(card)
+                        });
+                    };
+                    if (isDownloading) this.markCardDownloading(card);
                 }
             } else {
                 if (exactText) exactText.remove();
@@ -397,19 +506,12 @@ class MissingModelDownloaderUI {
                 headerAction.textContent = "Starting Downloads...";
                 headerAction.disabled = true;
                 exactMatches.forEach(match => {
-                    this.startDownload(match.exactResult.download_url, match.model.filename, match.folderType, "", false, match.exactResult.sha256, () => {
-                        const idx = this.missingModels.indexOf(match.model);
-                        if (idx !== -1) {
-                            const matchCard = this.modal ? this.modal.querySelector(`#mmd-missing-card-${idx}`) : null;
-                            if (matchCard) {
-                                matchCard.style.borderColor = "var(--mmd-success)";
-                                matchCard.style.backgroundColor = "rgba(76, 175, 80, 0.05)";
-                                const qBtn = matchCard.querySelector(".mmd-quick-dl-btn");
-                                if (qBtn) {
-                                    qBtn.textContent = "Downloading...";
-                                    qBtn.style.backgroundColor = "var(--mmd-success)";
-                                    qBtn.disabled = true;
-                                }
+                    this.startDownload(match.exactResult.download_url, match.model.filename, match.getFolder(), {
+                        ...this.cardDownloadOptions(match.model, match.model.filename, match.exactResult.sha256),
+                        onStarted: () => {
+                            const idx = this.missingModels.indexOf(match.model);
+                            if (idx !== -1) {
+                                this.markCardDownloading(this.modal ? this.modal.querySelector(`#mmd-missing-card-${idx}`) : null);
                             }
                         }
                     });
@@ -424,16 +526,57 @@ class MissingModelDownloaderUI {
         }
     }
 
-    /** Build sorted folder <option> HTML */
+    /** Build sorted folder <option> HTML, plus a trailing "Custom folder..." entry */
     buildFolderOptions(folders, selectedFolder) {
-        const sorted = [...folders].sort((a, b) => a.localeCompare(b));
+        const names = new Set([...folders, ...this.folders]);
+        if (selectedFolder) names.add(selectedFolder);
+        const sorted = [...names].sort((a, b) => a.localeCompare(b));
         return sorted.map(f =>
-            `<option value="${f}" ${f === selectedFolder ? 'selected' : ''}>${f}</option>`
-        ).join("");
+            `<option value="${escapeHtml(f).replace(/"/g, "&quot;")}" ${f === selectedFolder ? 'selected' : ''}>${escapeHtml(f)}</option>`
+        ).join("") + `<option value="${CUSTOM_FOLDER_VALUE}">Custom folder...</option>`;
+    }
+
+    /** Lets a folder <select> prompt for a custom folder name (created under models/). */
+    attachFolderSelect(select) {
+        let previous = select.value;
+        select.addEventListener("change", () => {
+            if (select.value !== CUSTOM_FOLDER_VALUE) {
+                previous = select.value;
+                return;
+            }
+            const name = (window.prompt("Folder name inside ComfyUI's models directory:", "") || "").trim();
+            if (!name) {
+                select.value = previous;
+                return;
+            }
+            if (!CUSTOM_FOLDER_RE.test(name) || /^\.+$/.test(name)) {
+                this.showToast("Folder name may only contain letters, numbers, spaces, '.', '_' and '-'.", true);
+                select.value = previous;
+                return;
+            }
+            if (!this.folders.includes(name)) this.folders.push(name);
+            let opt = [...select.options].find(o => o.value === name);
+            if (!opt) {
+                opt = document.createElement("option");
+                opt.value = name;
+                opt.textContent = name;
+                select.insertBefore(opt, select.lastElementChild);
+            }
+            select.value = name;
+            previous = name;
+        });
+    }
+
+    /** Rebuilds a folder <select>, keeping its current choice. */
+    refreshFolderSelect(select) {
+        if (!select) return;
+        const current = select.value && select.value !== CUSTOM_FOLDER_VALUE ? select.value : "checkpoints";
+        select.innerHTML = this.buildFolderOptions(this.folders, current);
+        select.value = current;
     }
 
     createModal() {
-        const folderOptionsHTML = this.buildFolderOptions(SORTED_FOLDERS, "checkpoints");
+        const folderOptionsHTML = this.buildFolderOptions(this.folders, "checkpoints");
 
         const backdrop = document.createElement("div");
         backdrop.className = "mmd-modal-backdrop";
@@ -478,7 +621,7 @@ class MissingModelDownloaderUI {
                             </div>
                             <div style="display: flex; gap: 8px; margin-bottom: 16px;">
                                 <input type="text" class="mmd-input" id="mmd-global-search-input" placeholder="Enter model name or keywords..." style="flex: 1;" />
-                                <select class="mmd-select" id="mmd-global-search-folder" style="width: 150px;">
+                                <select class="mmd-select" id="mmd-global-search-folder" style="width: 180px;">
                                     ${folderOptionsHTML}
                                 </select>
                                 <button class="mmd-btn mmd-btn-primary" id="mmd-global-search-btn">Search</button>
@@ -633,10 +776,13 @@ class MissingModelDownloaderUI {
         const globalSearchFolder = backdrop.querySelector("#mmd-global-search-folder");
         const globalSearchResults = backdrop.querySelector("#mmd-global-search-results");
 
+        this.attachFolderSelect(globalSearchFolder);
+        this.attachFolderSelect(backdrop.querySelector("#mmd-direct-folder"));
+
         if (globalSearchBtn) {
             globalSearchBtn.onclick = () => this.performGlobalSearch(
                 globalSearchInput.value, 
-                globalSearchFolder.value, 
+                globalSearchFolder, 
                 globalSearchResults, 
                 globalSearchBtn
             );
@@ -653,16 +799,16 @@ class MissingModelDownloaderUI {
         backdrop.querySelector("#mmd-verify-civitai-btn").onclick = () => this.handleVerifyCivitaiToken();
     }
 
-    openModal() {
+    async openModal() {
         if (!this.modal) return;
         this.modal.classList.add("active");
         this.populateSettingsFields();
         this.fetchActiveDownloads();
 
-        const globalSearchFolder = this.modal.querySelector("#mmd-global-search-folder");
-        if (globalSearchFolder && globalSearchFolder.children.length === 0) {
-            globalSearchFolder.innerHTML = this.buildFolderOptions(SORTED_FOLDERS, "checkpoints");
-        }
+        // Custom nodes can register model folders at any time, so refresh the list on open
+        await this.loadFolders();
+        this.refreshFolderSelect(this.modal.querySelector("#mmd-global-search-folder"));
+        this.refreshFolderSelect(this.modal.querySelector("#mmd-direct-folder"));
     }
 
     closeModal() {
@@ -794,7 +940,7 @@ class MissingModelDownloaderUI {
             card.className = "mmd-card";
             card.id = `mmd-missing-card-${index}`;
 
-            const availableFolders = model.available_folders || SORTED_FOLDERS;
+            const availableFolders = model.available_folders || this.folders;
             const folderOptions = this.buildFolderOptions(availableFolders, model.folder_type);
 
             card.innerHTML = `
@@ -804,6 +950,7 @@ class MissingModelDownloaderUI {
                         <div class="mmd-model-meta" style="margin-top: 4px;">
                             <span class="mmd-tag mmd-tag-node" style="cursor: pointer;" title="Click to locate node">${escapeHtml(model.node_type)}</span>
                             <span>${escapeHtml(model.widget_name)}</span>
+                            ${model.subfolder ? `<span title="Saved into this subfolder of the selected folder">in ${escapeHtml(model.subfolder)}/</span>` : ""}
                             ${this.activeSearches && this.activeSearches.has(model.filename) ? '<span class="mmd-card-searching mmd-searching-anim"><div class="mmd-loader" style="width: 10px; height: 10px; border-width: 2px; border-top-color: inherit; margin: 0; display: inline-block;"></div> Searching...</span>' : ''}
                         </div>
                     </div>
@@ -836,25 +983,36 @@ class MissingModelDownloaderUI {
                 }
             };
 
+            this.attachFolderSelect(folderSelect);
+
             collapseBtn.onclick = () => {
                 if (resultsContainer.style.display === "none") {
                     resultsContainer.style.display = "flex";
                     collapseBtn.textContent = "▼";
+                    this.expandedResults.add(model.filename);
                 } else {
                     resultsContainer.style.display = "none";
                     collapseBtn.textContent = "▶";
+                    this.expandedResults.delete(model.filename);
                 }
             };
 
-            searchBtn.onclick = () => this.searchModel(model.filename, folderSelect.value, resultsContainer, searchBtn, collapseBtn);
+            searchBtn.onclick = () => this.searchModel(model, folderSelect, resultsContainer, searchBtn, collapseBtn);
 
             list.appendChild(card);
+
+            // Re-renders happen after every completed download; restore results the user had open
+            const cache = this.searchCache[model.filename];
+            if (cache && this.expandedResults.has(model.filename)) {
+                this.renderSearchResults(cache.results, folderSelect, model, resultsContainer, collapseBtn);
+            }
         });
         
         this.checkExactMatches();
     }
 
-    async searchModel(filename, folderType, container, btn, collapseBtn) {
+    async searchModel(model, folderSelect, container, btn, collapseBtn) {
+        const filename = model.filename;
         btn.disabled = true;
         btn.textContent = "Searching...";
         collapseBtn.style.display = "none";
@@ -874,64 +1032,73 @@ class MissingModelDownloaderUI {
                 if (!resp.ok) throw new Error("Search failed.");
                 const data = await resp.json();
                 results = data.results || [];
-                this.searchCache[filename] = { results, time: Date.now(), folderType };
+                this.searchCache[filename] = { results, time: Date.now(), folderType: folderSelect.value };
                 this.checkExactMatches();
             }
 
-            if (results.length === 0) {
-                container.innerHTML = `
-                    <div style="font-size: 11px; color: var(--mmd-text-muted); padding: 6px 0;">
-                        No results found. Try the Direct Download tab with a URL.
-                    </div>
-                `;
-                return;
-            }
-
-            container.innerHTML = "";
-            results.forEach(res => {
-                const item = this.createResultItemElement(res, folderType, filename);
-                container.appendChild(item);
-            });
-            
-            collapseBtn.style.display = "inline-block";
-            collapseBtn.textContent = "▼";
-
+            this.expandedResults.add(filename);
+            this.renderSearchResults(results, folderSelect, model, container, collapseBtn);
         } catch (e) {
-            container.innerHTML = `<div style="color: var(--mmd-danger); font-size: 11px;">${e.message}</div>`;
+            container.innerHTML = `<div style="color: var(--mmd-danger); font-size: 11px;">${escapeHtml(e.message)}</div>`;
         } finally {
             btn.disabled = false;
             btn.textContent = "Search";
         }
     }
 
-    async startDownload(url, filename, folderType, targetDir = "", overwrite = false, sha256 = "", uiCallback = null) {
+    renderSearchResults(results, folderSelect, model, container, collapseBtn) {
+        container.style.display = "flex";
+        if (results.length === 0) {
+            container.innerHTML = `
+                <div style="font-size: 11px; color: var(--mmd-text-muted); padding: 6px 0;">
+                    No results found. Try the Direct Download tab with a URL.
+                </div>
+            `;
+            return;
+        }
+
+        container.innerHTML = "";
+        results.forEach(res => {
+            container.appendChild(this.createResultItemElement(res, folderSelect, model.filename, model));
+        });
+
+        collapseBtn.style.display = "inline-block";
+        collapseBtn.textContent = "▼";
+    }
+
+    /**
+     * Starts a download into folderType (optionally a subfolder of it). Returns the task id, or null.
+     * `binding` (from cardDownloadOptions) is remembered so the node can be repointed when it finishes.
+     */
+    async startDownload(url, filename, folderType, { overwrite = false, sha256 = "", subfolder = "", binding = null, onStarted = null } = {}) {
         try {
             const resp = await api.fetchApi("/model_downloader/start_download", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ url, filename, folder_type: folderType, target_dir: targetDir, overwrite, sha256 })
+                body: JSON.stringify({ url, filename, folder_type: folderType, subfolder, overwrite, sha256 })
             });
 
             if (resp.ok) {
+                const data = await resp.json();
                 this.showToast(`Starting: ${filename}`);
-                if (uiCallback) {
-                    uiCallback();
-                }
-                return;
+                if (binding && data.task_id) this.nodeBindings[data.task_id] = binding;
+                if (onStarted) onStarted();
+                return data.task_id || null;
             }
 
             const err = await resp.json();
             if (resp.status === 409) {
                 const confirmed = window.confirm(`"${filename}" already exists in the target folder. Overwrite it?`);
                 if (confirmed) {
-                    await this.startDownload(url, filename, folderType, targetDir, true, sha256, uiCallback);
+                    return await this.startDownload(url, filename, folderType, { overwrite: true, sha256, subfolder, binding, onStarted });
                 }
-                return;
+                return null;
             }
             this.showToast(err.message || "Download failed.", true);
         } catch (e) {
             this.showToast(e.message, true);
         }
+        return null;
     }
 
     async handleDirectDownload() {
@@ -939,20 +1106,38 @@ class MissingModelDownloaderUI {
         const folderSelect = this.modal.querySelector("#mmd-direct-folder");
         const filenameInput = this.modal.querySelector("#mmd-direct-filename");
 
-        const url = urlInput.value.trim();
+        let url = urlInput.value.trim();
         if (!url) { this.showToast("Enter a URL.", true); return; }
 
-        let filename = filenameInput.value.trim();
+        // Resolve the canonical download URL, real filename and SHA256 (Civitai links don't contain the filename)
+        let parsed = null;
+        try {
+            const resp = await api.fetchApi("/model_downloader/parse_url", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ url })
+            });
+            parsed = await resp.json();
+        } catch (e) {}
+        if (parsed && parsed.is_repo_only) {
+            this.showToast("That's a repository link. Paste the link to a specific file.", true);
+            return;
+        }
+        if (parsed && parsed.valid && parsed.download_url) url = parsed.download_url;
+
+        let filename = filenameInput.value.trim() || (parsed && parsed.valid && parsed.filename) || "";
         if (!filename) {
             filename = url.split("?")[0].split("/").pop();
             if (!filename || !filename.includes(".")) filename = "model.safetensors";
         }
 
-        await this.startDownload(url, filename, folderSelect.value, "", false, "", () => {
-            const dlTab = this.modal.querySelector('.mmd-tab[data-tab="downloads"]');
-            if (dlTab) dlTab.click();
+        const taskId = await this.startDownload(url, filename, folderSelect.value, {
+            sha256: (parsed && parsed.sha256) || "",
+            onStarted: () => {
+                const dlTab = this.modal.querySelector('.mmd-tab[data-tab="downloads"]');
+                if (dlTab) dlTab.click();
+            }
         });
-        urlInput.value = "";
+        if (taskId) urlInput.value = "";
     }
 
     async fetchActiveDownloads() {
@@ -977,7 +1162,7 @@ class MissingModelDownloaderUI {
 
         const tasks = Object.values(this.activeDownloads);
         
-        const activeTasks = tasks.filter(t => ["downloading", "queued", "pending", "verifying"].includes(t.status) || (t.status === "paused"));
+        const activeTasks = tasks.filter(t => IN_PROGRESS_STATUSES.includes(t.status));
         const historyTasks = tasks.filter(t => ["completed", "failed", "cancelled"].includes(t.status) && t.status !== "paused");
 
         list.innerHTML = "";
@@ -999,7 +1184,8 @@ class MissingModelDownloaderUI {
             const isCancelled = task.status === "cancelled";
             const isPaused = task.status === "paused";
             const isQueued = task.status === "queued" || task.status === "pending";
-            const isDownloading = task.status === "downloading";
+            const isRetrying = task.status === "retrying";
+            const isDownloading = task.status === "downloading" || isRetrying;
             const isVerifying = task.status === "verifying";
 
             let statusText = "";
@@ -1010,19 +1196,22 @@ class MissingModelDownloaderUI {
             else if (isPaused) { statusText = "Paused"; statusColor = "var(--mmd-warn)"; }
             else if (isQueued) { statusText = "Queued"; statusColor = "var(--mmd-warn)"; }
             else if (isVerifying) { statusText = "Verifying SHA256"; statusColor = "var(--mmd-warn)"; }
+            else if (isRetrying) { statusText = "Retrying"; statusColor = "var(--mmd-warn)"; }
             else { statusText = "Downloading"; statusColor = "var(--mmd-text-secondary)"; }
 
             const dlMB = ((task.downloaded_bytes || 0) / (1024 * 1024)).toFixed(1);
             const totalMB = task.total_bytes > 0 ? (task.total_bytes / (1024 * 1024)).toFixed(1) : "?";
 
             let statsText = "";
-            if (isDownloading) {
+            if (isRetrying) {
+                statsText = `${task.error || "Connection lost, retrying"} · ${dlMB}/${totalMB} MB`;
+            } else if (isDownloading) {
                 const speed = task.speed_mb || 0;
                 const etaMin = Math.floor((task.eta_seconds || 0) / 60);
                 const etaSec = Math.floor((task.eta_seconds || 0) % 60);
                 statsText = `${speed} MB/s · ${dlMB}/${totalMB} MB (${task.percentage || 0}%) · ETA ${etaMin}m ${etaSec}s`;
             } else if (isDone) {
-                statsText = `${dlMB} MB → ${task.folder_type}`;
+                statsText = `${dlMB} MB → ${task.folder_type}${task.subfolder ? "/" + task.subfolder : ""}`;
             } else if (isFailed) {
                 statsText = task.error || "Error";
             } else if (isPaused) {
@@ -1078,7 +1267,9 @@ class MissingModelDownloaderUI {
             }
             if (isFailed) {
                 card.querySelector(".mmd-retry-btn").onclick = () => {
-                    this.startDownload(task.url, task.filename, task.folder_type, "", true, task.expected_sha256);
+                    this.startDownload(task.url, task.filename, task.folder_type, {
+                        overwrite: true, sha256: task.expected_sha256 || "", subfolder: task.subfolder || ""
+                    });
                 };
             }
 
@@ -1089,7 +1280,11 @@ class MissingModelDownloaderUI {
         historyTasks.slice().reverse().forEach(task => renderCard(task, historyList));
     }
 
-    createResultItemElement(res, folderType, filenameFallback) {
+    /**
+     * `folderSelect` is read when Download is clicked, so changing the folder after searching takes effect.
+     * `model` is set for results under a missing-model card (keeps its subfolder, offers to repoint the node).
+     */
+    createResultItemElement(res, folderSelect, filenameFallback, model = null) {
         const item = document.createElement("div");
         item.className = "mmd-result-item";
 
@@ -1100,9 +1295,7 @@ class MissingModelDownloaderUI {
             ? `<span class="mmd-tag" style="background: var(--mmd-success-bg); color: var(--mmd-success);">Exact</span>`
             : "";
 
-        const sizeDisplay = res.size_bytes > 0
-            ? `${(res.size_bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
-            : "—";
+        const sizeDisplay = formatBytes(res.size_bytes) || "—";
 
         const gatedBadge = res.is_gated
             ? `<span class="mmd-tag" style="background: var(--mmd-danger-bg); color: var(--mmd-danger);">Auth</span>`
@@ -1132,7 +1325,8 @@ class MissingModelDownloaderUI {
 
         item.querySelector(".mmd-dl-btn").onclick = (e) => {
             const btn = e.target;
-            this.startDownload(res.download_url, displayName, folderType, "", false, res.sha256, () => {
+            const opts = model ? this.cardDownloadOptions(model, displayName, res.sha256) : { sha256: res.sha256 };
+            this.startDownload(res.download_url, displayName, folderSelect.value, { ...opts, onStarted: () => {
                 btn.textContent = "Downloading...";
                 btn.style.backgroundColor = "var(--mmd-success)";
                 btn.style.borderColor = "var(--mmd-success)";
@@ -1145,13 +1339,13 @@ class MissingModelDownloaderUI {
                 if (parentCard) {
                     parentCard.style.borderColor = "var(--mmd-success)";
                 }
-            });
+            } });
         };
         
         return item;
     }
 
-    async performGlobalSearch(query, folderType, container, btn) {
+    async performGlobalSearch(query, folderSelect, container, btn) {
         query = (query || "").trim();
         if (!query) return;
 
@@ -1179,7 +1373,7 @@ class MissingModelDownloaderUI {
 
             container.innerHTML = "";
             results.forEach(res => {
-                const item = this.createResultItemElement(res, folderType, "model.safetensors");
+                const item = this.createResultItemElement(res, folderSelect, "model.safetensors");
                 container.appendChild(item);
             });
         } catch (e) {
@@ -1191,23 +1385,23 @@ class MissingModelDownloaderUI {
         }
     }
 
-    showBanner(msg) {
+    showBanner(msg, actionLabel = "Resolve", onAction = () => this.openModal(), timeoutMs = 6000) {
         const existing = document.querySelector(".mmd-banner");
         if (existing) existing.remove();
 
         const banner = document.createElement("div");
         banner.className = "mmd-banner";
         banner.innerHTML = `
-            <span>${msg}</span>
-            <button class="mmd-btn mmd-btn-primary" style="padding: 3px 8px; font-size: 10px;" id="mmd-banner-btn">Resolve</button>
+            <span>${escapeHtml(msg)}</span>
+            <button class="mmd-btn mmd-btn-primary" style="padding: 3px 8px; font-size: 10px;" id="mmd-banner-btn">${escapeHtml(actionLabel)}</button>
             <button style="background: none; border: none; color: var(--mmd-text-muted); cursor: pointer; font-size: 14px;" id="mmd-banner-close">&times;</button>
         `;
 
-        banner.querySelector("#mmd-banner-btn").onclick = () => { banner.remove(); this.openModal(); };
+        banner.querySelector("#mmd-banner-btn").onclick = () => { banner.remove(); onAction(); };
         banner.querySelector("#mmd-banner-close").onclick = () => banner.remove();
 
         document.body.appendChild(banner);
-        setTimeout(() => { if (banner.parentNode) banner.remove(); }, 6000);
+        setTimeout(() => { if (banner.parentNode) banner.remove(); }, timeoutMs);
     }
 
     showToast(msg, isError = false) {

@@ -58,7 +58,6 @@ Copy the `ComfyUI-ModelDownloader_SG` folder into your ComfyUI `custom_nodes/` d
       web/
         js/
           missing_model_downloader.js
-        css/
           style.css
 ```
 
@@ -96,6 +95,21 @@ The addon also registers a passthrough node called **"📦 Model Downloader (SG)
 - Python 3.9+
 - `aiohttp >= 3.8.0`
 - `requests >= 2.28.0`
+- `huggingface-hub[hf_transfer] >= 0.24.0`
+- `tqdm`
+
+## ✨ v1.2.0 Changes
+
+- **Downloads straight from workflow URLs.** Official ComfyUI templates record each model's download link and folder. Those models now show "URL from workflow" and download with one click, without a search.
+- **Any model folder.** Every folder ComfyUI has registered (including ones added by other custom nodes) can be picked, plus a custom folder under `models/`.
+- **Subfolders kept.** A workflow that references `flux/model.safetensors` gets the file saved into `<folder>/flux/`.
+- **Update the node.** After downloading a file with a different name than the workflow expects, a banner offers to point the node at it.
+- **Pausing Hugging Face downloads keeps progress.** Resume continues where it left off, including after a ComfyUI restart.
+- **Civitai downloads are verified** against the SHA256 that Civitai publishes. Direct Civitai links now get the real filename.
+- **Auto-retry.** Civitai and direct-URL downloads retry dropped connections up to 3 times and resume from where they stopped.
+- **Disk-space check.** Downloads that won't fit (plus 1 GB to spare) fail straight away with a clear message.
+- **Exact matches stay visible** after other downloads finish, and show the file size.
+- The download endpoint no longer accepts an arbitrary target directory from the browser.
 
 ## 🔒 v1.1.0 Changes
 

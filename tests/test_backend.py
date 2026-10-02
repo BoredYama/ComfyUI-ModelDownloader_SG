@@ -5,7 +5,11 @@ Unit test and verification suite for ComfyUI Missing Model Downloader backend mo
 import os
 import sys
 import tempfile
+import threading
 import time
+from collections import namedtuple
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 
 if sys.platform == "win32":
     try:
@@ -22,26 +26,86 @@ from config_manager import config_manager
 from hf_client import hf_client
 from civitai_client import civitai_client
 from detector import detector
+import downloader
 from downloader import download_manager, host_matches, redact_url_secrets
+
+
+def wait_for_task(task_id, timeout=15):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        task = download_manager.get_task(task_id)
+        if task and task["status"] in ("completed", "failed", "cancelled", "paused"):
+            return task
+        time.sleep(0.1)
+    return download_manager.get_task(task_id)
+
+
+class FlakyFileServer:
+    """
+    Local HTTP server for one file with Range support. The first `drops` full requests
+    send the headers for the whole file but close the connection halfway through.
+    """
+    def __init__(self, payload: bytes, drops: int = 0):
+        self.payload = payload
+        self.drops_left = drops
+        self.requests = []
+        server_ref = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                range_header = self.headers.get("Range")
+                server_ref.requests.append(range_header)
+                start = int(range_header.split("=")[1].rstrip("-")) if range_header else 0
+                body = server_ref.payload[start:]
+                self.send_response(206 if range_header else 200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if server_ref.drops_left > 0 and not range_header:
+                    server_ref.drops_left -= 1
+                    self.wfile.write(body[: len(body) // 2])
+                    self.wfile.flush()
+                    self.close_connection = True
+                    return
+                self.wfile.write(body)
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/model.safetensors"
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
 
 def test_config_manager():
     print("--- Testing ConfigManager ---")
-    config_manager.update({
-        "hf_token": "hf_testdummytoken1234567890",
-        "default_provider": "huggingface",
-        "auto_detect_on_load": True
-    })
-    
-    sanitized = config_manager.get_sanitized()
-    assert sanitized["has_hf_token"] is True, "Expected has_hf_token to be True"
-    assert "hf_testdummytoken1234567890" not in str(sanitized), "Raw token should not be present in sanitized output"
-    assert "hf_testdummytoken1234567890" == config_manager.get_hf_token(), "Raw token should match stored token"
-    print("✓ ConfigManager token storage and sanitization passed.")
+    # Redirect saves to a temp file and snapshot in-memory config so the real config.json is untouched
+    original_config = dict(config_manager._config)
+    with tempfile.TemporaryDirectory() as temp_dir, \
+            patch("config_manager.CONFIG_PATH", os.path.join(temp_dir, "config.json")):
+        try:
+            config_manager.update({
+                "hf_token": "hf_testdummytoken1234567890",
+                "default_provider": "huggingface",
+                "auto_detect_on_load": True
+            })
 
-    config_manager.update({"hf_token": ""})
-    sanitized = config_manager.get_sanitized()
-    assert sanitized["has_hf_token"] is False
-    print("✓ ConfigManager reset passed.")
+            sanitized = config_manager.get_sanitized()
+            assert sanitized["has_hf_token"] is True, "Expected has_hf_token to be True"
+            assert "hf_testdummytoken1234567890" not in str(sanitized), "Raw token should not be present in sanitized output"
+            assert "hf_testdummytoken1234567890" == config_manager.get_hf_token(), "Raw token should match stored token"
+            print("✓ ConfigManager token storage and sanitization passed.")
+
+            config_manager.update({"hf_token": ""})
+            sanitized = config_manager.get_sanitized()
+            assert sanitized["has_hf_token"] is False
+            print("✓ ConfigManager reset passed.")
+        finally:
+            config_manager._config = original_config
 
 def test_hf_client_url_parsing():
     print("\n--- Testing HuggingFace URL Parsing ---")
@@ -124,6 +188,39 @@ def test_detector_graph_scanning():
     assert types["vae"] == "test_vae_nonexistent_123.safetensors"
     print("✓ Model detection and folder inference passed flawlessly.")
 
+def test_detector_uses_workflow_model_urls_and_subfolders():
+    print("\n--- Testing Workflow-Embedded Model URLs ---")
+    url = "https://huggingface.co/Comfy-Org/flux1-dev/resolve/main/flux1-dev-fp8.safetensors?download=true"
+    workflow = {
+        "nodes": [{
+            "id": 7,
+            "type": "UNETLoader",
+            "widgets_values": ["flux/flux1-dev-fp8.safetensors", "default"],
+            "properties": {"models": [{
+                "name": "flux1-dev-fp8.safetensors", "url": url, "directory": "diffusion_models",
+                "hash": "ABC123", "hash_type": "SHA256"
+            }]}
+        }, {
+            "id": 8,
+            "type": "LoraLoader",
+            "widgets_values": ["../../evil/lora_xyz.safetensors", 1.0, 1.0],
+            "properties": {"models": [{"name": "lora_xyz.safetensors", "url": "file:///etc/passwd", "directory": "../x"}]}
+        }]
+    }
+    missing = {m["filename"]: m for m in detector.detect_missing_models(workflow)}
+
+    flux = missing["flux1-dev-fp8.safetensors"]
+    assert flux["known_url"] == url
+    assert flux["known_sha256"] == "abc123"
+    assert flux["folder_type"] == "diffusion_models"
+    assert flux["subfolder"] == "flux"
+
+    lora = missing["lora_xyz.safetensors"]
+    assert lora["known_url"] == "", "Non-http(s) workflow URLs must be ignored"
+    assert lora["folder_type"] == "loras", "Unsafe workflow directories must be ignored"
+    assert lora["subfolder"] == "", "Traversal subfolders must be dropped"
+    print("✓ Workflow URLs, folders and subfolders are used; unsafe ones are ignored.")
+
 def test_host_matches_rejects_lookalike_domains():
     print("\n--- Testing Exact-Host Token Matching (security) ---")
     assert host_matches("huggingface.co", "huggingface.co") is True
@@ -190,6 +287,73 @@ def test_overwrite_protection():
         except FileExistsError as e:
             print(f"✓ Existing file protected without overwrite flag: {e}")
 
+def test_custom_folder_validation():
+    print("\n--- Testing Custom Folder Validation ---")
+    target = detector.get_target_directory("my_custom_models")
+    assert target.endswith(os.path.join("models", "my_custom_models")), target
+    for bad in ("../escape", "a/b", "..", "", "custom_nodes"):
+        try:
+            detector.get_target_directory(bad)
+            raise AssertionError(f"Expected ValueError for folder '{bad}'")
+        except ValueError:
+            pass
+    print("✓ Custom folders resolve under models/ and unsafe names are rejected.")
+
+def test_subfolder_downloads_and_traversal():
+    print("\n--- Testing Subfolder Downloads ---")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        for bad in ("../escape", "/abs", "a/../../b", "a//b"):
+            try:
+                download_manager.start_download("https://example.com/m.safetensors", "m.safetensors", temp_dir, subfolder=bad)
+                raise AssertionError(f"Expected ValueError for subfolder '{bad}'")
+            except ValueError:
+                pass
+        print("✓ Unsafe subfolders rejected.")
+
+        server = FlakyFileServer(b"x" * 1000)
+        try:
+            task_id = download_manager.start_download(server.url, "m.safetensors", temp_dir, "checkpoints", subfolder="flux/dev")
+            task = wait_for_task(task_id)
+            assert task["status"] == "completed", task
+            assert task["subfolder"] == "flux/dev"
+            assert os.path.getsize(os.path.join(temp_dir, "flux", "dev", "m.safetensors")) == 1000
+        finally:
+            server.close()
+        print("✓ Download saved into its subfolder.")
+
+def test_disk_space_check():
+    print("\n--- Testing Disk Space Check ---")
+    Usage = namedtuple("Usage", "total used free")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        server = FlakyFileServer(b"x" * 5000)
+        try:
+            with patch("downloader.shutil.disk_usage", return_value=Usage(10, 0, 10)):
+                task_id = download_manager.start_download(server.url, "big.safetensors", temp_dir)
+                task = wait_for_task(task_id)
+        finally:
+            server.close()
+        assert task["status"] == "failed", task
+        assert "Not enough disk space" in task["error"], task["error"]
+        assert not os.path.exists(os.path.join(temp_dir, "big.safetensors"))
+    print(f"✓ Download refused: {task['error']}")
+
+def test_http_retry_resumes_after_drop():
+    print("\n--- Testing HTTP Auto-Retry ---")
+    payload = os.urandom(3 * 1024 * 1024)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        server = FlakyFileServer(payload, drops=1)
+        try:
+            with patch("downloader.HTTP_RETRY_DELAYS", (0.2, 0.2, 0.2)):
+                task_id = download_manager.start_download(server.url, "flaky.safetensors", temp_dir)
+                task = wait_for_task(task_id)
+        finally:
+            server.close()
+        assert task["status"] == "completed", task
+        with open(os.path.join(temp_dir, "flaky.safetensors"), "rb") as f:
+            assert f.read() == payload, "Resumed file must match the original byte for byte"
+        assert server.requests[0] is None and server.requests[-1] and server.requests[-1].startswith("bytes="), server.requests
+    print(f"✓ Connection drop retried and resumed (requests: {server.requests}).")
+
 def test_downloader_lifecycle():
     print("\n--- Testing Downloader Manager Lifecycle ---")
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -228,6 +392,11 @@ if __name__ == "__main__":
     test_redact_url_secrets()
     test_path_traversal_is_blocked()
     test_overwrite_protection()
+    test_custom_folder_validation()
+    test_detector_uses_workflow_model_urls_and_subfolders()
+    test_subfolder_downloads_and_traversal()
+    test_disk_space_check()
+    test_http_retry_resumes_after_drop()
     test_downloader_lifecycle()
     print("\n========================================")
     print("🎉 ALL TESTS PASSED SUCCESSFULLY!")

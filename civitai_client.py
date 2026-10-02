@@ -8,6 +8,21 @@ from config_manager import config_manager
 CIVITAI_API_BASE = "https://civitai.com/api/v1"
 MODEL_EXTENSIONS = (".safetensors", ".gguf", ".ckpt", ".pt", ".bin", ".pth", ".onnx")
 
+def file_sha256(file_info) -> str:
+    """Civitai lists per-file hashes; SHA256 lets the downloader verify the result."""
+    if not file_info:
+        return ""
+    return ((file_info.get("hashes") or {}).get("SHA256") or "").lower()
+
+
+def primary_file(files: list):
+    """The version's main model file (Civitai flags it), else the first listed file."""
+    for f in files or []:
+        if f.get("primary"):
+            return f
+    return files[0] if files else None
+
+
 class CivitaiClient:
     def __init__(self):
         pass
@@ -94,8 +109,9 @@ class CivitaiClient:
                         matched_file = f
                         break
 
-                display_file_name = matched_file.get("name") if matched_file else (files[0].get("name") if files else f"{clean_query}.safetensors")
-                size_kb = matched_file.get("sizeKB") if matched_file else (files[0].get("sizeKB") if files else 0)
+                chosen_file = matched_file or (files[0] if files else None)
+                display_file_name = chosen_file.get("name") if chosen_file else f"{clean_query}.safetensors"
+                size_kb = chosen_file.get("sizeKB") if chosen_file else 0
                 size_bytes = int(size_kb * 1024) if size_kb else 0
 
                 is_exact_match = (display_file_name.lower() == target_lower)
@@ -119,6 +135,7 @@ class CivitaiClient:
                     "download_url": final_download_url,
                     "thumbnail": thumbnail,
                     "size_bytes": size_bytes,
+                    "sha256": file_sha256(chosen_file),
                     "downloads": downloads,
                     "favorites": favorites,
                     "score": score,
@@ -143,31 +160,35 @@ class CivitaiClient:
         # downloader.py attaches the token as an Authorization header at fetch time,
         # so it never needs to sit in a URL that's echoed to the client or logged.
 
-        # Direct download endpoint
-        match_dl = re.search(r"/api/download/models/(\d+)", url)
-        if match_dl:
-            version_id = match_dl.group(1)
+        # Direct download endpoint, or model page with a version parameter
+        match_version = re.search(r"/api/download/models/(\d+)", url) or \
+            re.search(r"civitai\.com/models/\d+.*?[?&]modelVersionId=(\d+)", url)
+        if match_version:
+            version_id = match_version.group(1)
             dl_url = f"https://civitai.com/api/download/models/{version_id}"
-            return {
+            result = {
                 "source": "civitai",
                 "valid": True,
                 "version_id": int(version_id),
                 "download_url": dl_url,
-                "filename": f"civitai_model_{version_id}.safetensors"
+                "filename": f"civitai_model_{version_id}.safetensors",
+                "sha256": "",
+                "size_bytes": 0
             }
-
-        # Model page with version parameter
-        match_model_version = re.search(r"civitai\.com/models/(\d+).*?[?&]modelVersionId=(\d+)", url)
-        if match_model_version:
-            version_id = match_model_version.group(2)
-            dl_url = f"https://civitai.com/api/download/models/{version_id}"
-            return {
-                "source": "civitai",
-                "valid": True,
-                "version_id": int(version_id),
-                "download_url": dl_url,
-                "filename": f"civitai_model_{version_id}.safetensors"
-            }
+            # Look up the real filename and hash; fall back to the placeholder name if the API is unreachable
+            try:
+                api_url = f"{CIVITAI_API_BASE}/model-versions/{version_id}"
+                req = urllib.request.Request(api_url, headers=self._get_headers(token))
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    version = json.loads(resp.read().decode("utf-8"))
+                f = primary_file(version.get("files", []))
+                if f:
+                    result["filename"] = f.get("name") or result["filename"]
+                    result["sha256"] = file_sha256(f)
+                    result["size_bytes"] = int((f.get("sizeKB") or 0) * 1024)
+            except Exception as e:
+                print(f"[ModelDownloader] Civitai version lookup failed for {version_id}: {e}")
+            return result
 
         # Model page base
         match_model = re.search(r"civitai\.com/models/(\d+)", url)
@@ -183,8 +204,8 @@ class CivitaiClient:
                     if versions:
                         prim_ver = versions[0]
                         v_id = prim_ver.get("id")
-                        files = prim_ver.get("files", [])
-                        fname = files[0].get("name") if files else f"{info.get('name')}.safetensors"
+                        f = primary_file(prim_ver.get("files", []))
+                        fname = f.get("name") if f else f"{info.get('name')}.safetensors"
                         dl_url = prim_ver.get("downloadUrl") or f"https://civitai.com/api/download/models/{v_id}"
                         return {
                             "source": "civitai",
@@ -192,7 +213,9 @@ class CivitaiClient:
                             "model_id": int(model_id),
                             "version_id": v_id,
                             "filename": fname,
-                            "download_url": dl_url
+                            "download_url": dl_url,
+                            "sha256": file_sha256(f),
+                            "size_bytes": int((f.get("sizeKB") or 0) * 1024) if f else 0
                         }
             except Exception as e:
                 return {"valid": False, "error": f"Failed to retrieve Civitai model details: {e}"}

@@ -60,6 +60,53 @@ NODE_TYPE_TO_FOLDER = {
 
 MODEL_EXTENSIONS = (".safetensors", ".gguf", ".ckpt", ".pt", ".bin", ".pth", ".onnx")
 
+# Registered folder types that are not model directories and must never be download targets
+EXCLUDED_FOLDERS = {"custom_nodes"}
+
+# Custom (unregistered) folder names are created under models/, so keep them to a single safe path segment
+CUSTOM_FOLDER_RE = re.compile(r"^[A-Za-z0-9_\-][A-Za-z0-9_.\- ]*$")
+
+def is_safe_folder_name(name: str) -> bool:
+    """True for a single path segment that can't escape its parent (no separators, not just dots)."""
+    return bool(name) and bool(CUSTOM_FOLDER_RE.match(name)) and name.strip(".").strip() != ""
+
+
+def collect_workflow_model_urls(workflow: dict) -> dict:
+    """
+    ComfyUI templates embed download info as `models: [{name, url, directory, hash?, hash_type?}]`,
+    both at the top level of the workflow and in each node's `properties`. Returns lowercase
+    basename -> entry for every entry that has an http(s) URL.
+    """
+    if not isinstance(workflow, dict):
+        return {}
+
+    entry_lists = [workflow.get("models")]
+    node_lists = [workflow.get("nodes")]
+    for sg in (workflow.get("definitions") or {}).get("subgraphs") or []:
+        if isinstance(sg, dict):
+            node_lists.append(sg.get("nodes"))
+    for nodes_list in node_lists:
+        for node in nodes_list or []:
+            if isinstance(node, dict) and isinstance(node.get("properties"), dict):
+                entry_lists.append(node["properties"].get("models"))
+
+    urls = {}
+    for entries in entry_lists:
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name, url = entry.get("name"), entry.get("url")
+            if not isinstance(name, str) or not isinstance(url, str):
+                continue
+            if not url.lower().startswith(("http://", "https://")):
+                continue
+            key = os.path.basename(name.replace("\\", "/")).lower()
+            urls.setdefault(key, entry)
+    return urls
+
+
 class MissingModelDetector:
     def __init__(self):
         pass
@@ -69,6 +116,8 @@ class MissingModelDetector:
         if HAS_FOLDER_PATHS and hasattr(folder_paths, "folder_names_and_paths"):
             result = {}
             for folder_type, (dirs, exts) in folder_paths.folder_names_and_paths.items():
+                if folder_type in EXCLUDED_FOLDERS:
+                    continue
                 result[folder_type] = {
                     "paths": dirs,
                     "extensions": list(exts) if isinstance(exts, set) else exts
@@ -97,7 +146,12 @@ class MissingModelDetector:
         return []
 
     def get_target_directory(self, folder_type: str) -> str:
-        """Returns the primary filesystem directory for a folder type."""
+        """
+        Returns the primary filesystem directory for a folder type. Unregistered names are
+        treated as a custom folder under the models directory.
+        """
+        if folder_type in EXCLUDED_FOLDERS:
+            raise ValueError(f"'{folder_type}' is not a model folder")
         if HAS_FOLDER_PATHS:
             try:
                 paths = folder_paths.get_folder_paths(folder_type)
@@ -105,9 +159,13 @@ class MissingModelDetector:
                     return paths[0]
             except Exception:
                 pass
-        # Fallback
-        base_dir = os.path.join(os.getcwd(), "models", folder_type)
-        return base_dir
+
+        if not is_safe_folder_name(folder_type):
+            raise ValueError(f"Invalid folder name: '{folder_type}'")
+        models_dir = getattr(folder_paths, "models_dir", None) if HAS_FOLDER_PATHS else None
+        if not models_dir:
+            models_dir = os.path.join(os.getcwd(), "models")
+        return os.path.join(models_dir, folder_type.strip())
 
     def infer_folder_type(self, node_type: str, widget_name: str, value: str) -> str:
         """Infers the ComfyUI folder category from widget name, node class, or value."""
@@ -274,6 +332,8 @@ class MissingModelDetector:
             if f not in folder_names:
                 folder_names.append(f)
 
+        workflow_urls = collect_workflow_model_urls(workflow_data.get("workflow") or workflow_data)
+
         # Deduplicate and verify against folder_paths
         missing_models = []
         seen = set()
@@ -329,10 +389,30 @@ class MissingModelDetector:
                         pass
 
             if not exists:
-                target_dir = self.get_target_directory(folder_type)
+                # Prefer the download URL and folder the workflow author recorded, over searching
+                known = workflow_urls.get(filename.lower())
+                directory = known.get("directory") if known else None
+                if isinstance(directory, str) and is_safe_folder_name(directory):
+                    folder_type = directory
+                known_sha256 = ""
+                if known and str(known.get("hash_type", "")).lower() == "sha256":
+                    known_sha256 = str(known.get("hash") or "").lower()
+
+                # Keep subfolders like "flux/model.safetensors" so the node's path resolves after download
+                subfolder = os.path.dirname(raw_val.replace("\\", "/")).strip("/")
+                if subfolder and not all(is_safe_folder_name(seg) for seg in subfolder.split("/")):
+                    subfolder = ""
+
+                try:
+                    target_dir = self.get_target_directory(folder_type)
+                except ValueError:
+                    target_dir = ""
                 missing_models.append({
                     "filename": filename,
                     "original_value": raw_val,
+                    "subfolder": subfolder,
+                    "known_url": known["url"] if known else "",
+                    "known_sha256": known_sha256,
                     "folder_type": folder_type,
                     "target_dir": target_dir,
                     "available_folders": folder_names,

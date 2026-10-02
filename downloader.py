@@ -1,11 +1,13 @@
 import os
+import re
+import shutil
 import time
 import uuid
 import threading
-import urllib.request
 import urllib.parse
-import urllib.error
 from config_manager import config_manager
+from detector import is_safe_folder_name
+from hf_client import hf_client
 
 # Handle ComfyUI imports if running inside ComfyUI
 try:
@@ -34,7 +36,7 @@ def redact_url_secrets(url: str) -> str:
 
 
 class DownloadTask:
-    def __init__(self, task_id: str, url: str, target_path: str, filename: str, folder_type: str = "", expected_sha256: str = ""):
+    def __init__(self, task_id: str, url: str, target_path: str, filename: str, folder_type: str = "", expected_sha256: str = "", subfolder: str = ""):
         self.id = task_id
         self.url = url
         self.target_path = target_path
@@ -42,6 +44,7 @@ class DownloadTask:
         self.filename = filename
         self.folder_type = folder_type
         self.expected_sha256 = expected_sha256
+        self.subfolder = subfolder
         
         self.status = "pending"  # pending, downloading, completed, failed, cancelled
         self.total_bytes = 0
@@ -62,6 +65,8 @@ class DownloadTask:
             "id": self.id,
             "filename": self.filename,
             "folder_type": self.folder_type,
+            "subfolder": self.subfolder,
+            "expected_sha256": self.expected_sha256,
             "target_path": self.target_path,
             "url": redact_url_secrets(self.url),
             "status": "paused" if self.is_paused else self.status,
@@ -85,23 +90,52 @@ def host_matches(netloc: str, domain: str) -> bool:
     return host == domain or host.endswith("." + domain)
 
 
-class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """
-    Custom redirect handler that strips Authorization headers when redirected
-    to third-party domains (such as AWS S3 / CloudFront for Hugging Face or Cloudflare for Civitai).
-    """
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new_req:
-            orig_host = urllib.parse.urlparse(req.full_url).netloc
-            new_host = urllib.parse.urlparse(newurl).netloc
-            # If redirected to a different domain, strip Authorization to avoid AWS S3 signature rejection
-            if orig_host.lower() != new_host.lower():
-                if "Authorization" in new_req.headers:
-                    del new_req.headers["Authorization"]
-                if "authorization" in new_req.headers:
-                    del new_req.headers["authorization"]
-        return new_req
+# Statuses of tasks that hold (or wait for) a download slot
+ACTIVE_STATUSES = ("pending", "queued", "downloading", "retrying")
+
+# Free space kept on the drive beyond the file itself
+DISK_SPACE_MARGIN = 1024 ** 3
+
+# Waits between HTTP retries; the count resets whenever an attempt makes progress
+HTTP_RETRY_DELAYS = (2, 5, 10)
+
+HF_URL_RE = re.compile(r"huggingface\.co/([^/]+/[^/]+)/(?:resolve|blob)/([^/]+)/([^?#]*)")
+
+
+class InsufficientDiskSpace(Exception):
+    pass
+
+
+class RetryableHTTPError(Exception):
+    """A server-side (5xx) response worth retrying."""
+
+
+def format_size(num_bytes: int) -> str:
+    if num_bytes >= 1024 ** 3:
+        return f"{num_bytes / (1024 ** 3):.1f} GB"
+    return f"{num_bytes / (1024 ** 2):.1f} MB"
+
+
+def check_disk_space(directory: str, needed_bytes: int):
+    """Raises InsufficientDiskSpace if needed_bytes (plus a safety margin) won't fit in directory's drive."""
+    if needed_bytes <= 0:
+        return
+    free = shutil.disk_usage(directory).free
+    if needed_bytes + DISK_SPACE_MARGIN > free:
+        raise InsufficientDiskSpace(
+            f"Not enough disk space: needs {format_size(needed_bytes)} (+{format_size(DISK_SPACE_MARGIN)} margin), {format_size(free)} free"
+        )
+
+
+def dir_size(path: str) -> int:
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
 
 
 MAX_FINISHED_TASKS = 50  # cap retained completed/failed/cancelled tasks so history doesn't grow forever
@@ -134,10 +168,11 @@ class DownloadManager:
                         target_path=task_dict["target_path"],
                         filename=task_dict["filename"],
                         folder_type=task_dict.get("folder_type", ""),
-                        expected_sha256=task_dict.get("expected_sha256", "")
+                        expected_sha256=task_dict.get("expected_sha256", ""),
+                        subfolder=task_dict.get("subfolder", "")
                     )
                     t.status = task_dict["status"]
-                    if t.status in ("downloading", "queued", "pending"):
+                    if t.status in ACTIVE_STATUSES:
                         t.status = "paused"
                         t.is_paused = True
                     t.total_bytes = task_dict.get("total_bytes", 0)
@@ -162,6 +197,7 @@ class DownloadManager:
                         "filename": t.filename,
                         "folder_type": t.folder_type,
                         "expected_sha256": getattr(t, 'expected_sha256', ""),
+                        "subfolder": getattr(t, 'subfolder', ""),
                         "status": "paused" if getattr(t, 'is_paused', False) else t.status,
                         "total_bytes": getattr(t, 'total_bytes', 0),
                         "downloaded_bytes": getattr(t, 'downloaded_bytes', 0),
@@ -188,7 +224,7 @@ class DownloadManager:
             if not task:
                 return False
             task.cancel_requested = True
-            if task.status in ("downloading", "queued", "pending"):
+            if task.status in ACTIVE_STATUSES:
                 task.status = "cancelled"
             if task_id in self.queue:
                 self.queue.remove(task_id)
@@ -199,7 +235,7 @@ class DownloadManager:
     def pause_task(self, task_id: str) -> bool:
         with self.lock:
             task = self.tasks.get(task_id)
-            if not task or task.status not in ("downloading", "queued", "pending"):
+            if not task or task.status not in ACTIVE_STATUSES:
                 return False
             task.is_paused = True
             if task_id in self.queue:
@@ -225,7 +261,7 @@ class DownloadManager:
     def clear_history(self) -> int:
         cleared = 0
         with self.lock:
-            active_ids = [tid for tid, t in self.tasks.items() if t.status in ("downloading", "queued", "pending") and not t.is_paused]
+            active_ids = [tid for tid, t in self.tasks.items() if t.status in ACTIVE_STATUSES and not t.is_paused]
             to_remove = [tid for tid in self.tasks.keys() if tid not in active_ids]
             for tid in to_remove:
                 del self.tasks[tid]
@@ -246,11 +282,12 @@ class DownloadManager:
         for tid in finished_ids[:excess]:
             self.tasks.pop(tid, None)
 
-    def start_download(self, url: str, filename: str, target_dir: str, folder_type: str = "", overwrite: bool = False, expected_sha256: str = "") -> str:
+    def start_download(self, url: str, filename: str, target_dir: str, folder_type: str = "", overwrite: bool = False, expected_sha256: str = "", subfolder: str = "") -> str:
         """
         Validates the destination is contained within target_dir (no path traversal),
         registers a task, and either starts it immediately or queues it if the
-        configured concurrency limit is already reached.
+        configured concurrency limit is already reached. `subfolder` (e.g. "flux/dev")
+        is created under target_dir.
         """
         parsed_url = urllib.parse.urlparse(url)
         if parsed_url.scheme not in ("http", "https"):
@@ -262,19 +299,24 @@ class DownloadManager:
         if not safe_filename or safe_filename in (".", ".."):
             raise ValueError("Invalid filename")
 
-        target_dir = os.path.abspath(target_dir)
-        os.makedirs(target_dir, exist_ok=True)
-        target_path = os.path.abspath(os.path.join(target_dir, safe_filename))
+        segments = [seg for seg in (subfolder or "").replace("\\", "/").split("/")] if subfolder else []
+        if any(not is_safe_folder_name(seg) for seg in segments):
+            raise ValueError(f"Invalid subfolder: '{subfolder}'")
+
+        base_dir = os.path.abspath(target_dir)
+        dest_dir = os.path.abspath(os.path.join(base_dir, *segments))
+        target_path = os.path.abspath(os.path.join(dest_dir, safe_filename))
 
         # Belt-and-braces: confirm the resolved path is still inside target_dir
-        if os.path.commonpath([target_dir, target_path]) != target_dir:
+        if os.path.commonpath([base_dir, target_path]) != base_dir:
             raise ValueError("Resolved download path escapes the target directory")
+        os.makedirs(dest_dir, exist_ok=True)
 
         if os.path.exists(target_path) and not overwrite:
             raise FileExistsError(f"'{safe_filename}' already exists in the target folder")
 
         task_id = str(uuid.uuid4())[:8]
-        task = DownloadTask(task_id, url, target_path, safe_filename, folder_type, expected_sha256)
+        task = DownloadTask(task_id, url, target_path, safe_filename, folder_type, expected_sha256, "/".join(segments))
 
         with self.lock:
             self._prune_finished_locked()
@@ -346,16 +388,35 @@ class DownloadManager:
             except Exception:
                 pass
 
-    def _finish_cancelled(self, task: DownloadTask):
-        """Marks a task cancelled and removes its partial .downloading file (explicit cancel = discard)."""
-        task.status = "cancelled"
+    def _hf_temp_dir(self, task: DownloadTask) -> str:
+        """Per-task local_dir for hf_hub_download. Kept while paused so the partial download resumes."""
+        return os.path.join(os.path.dirname(task.temp_path), f".hf_tmp_{task.id}")
+
+    def _remove_partial_files(self, task: DownloadTask):
         try:
             if os.path.exists(task.temp_path):
                 os.remove(task.temp_path)
         except OSError as e:
-            print(f"[ModelDownloader] Failed to remove temp file after cancel: {e}")
+            print(f"[ModelDownloader] Failed to remove temp file: {e}")
+        shutil.rmtree(self._hf_temp_dir(task), ignore_errors=True)
+
+    def _finish_cancelled(self, task: DownloadTask):
+        """Marks a task cancelled and removes its partial files (explicit cancel = discard)."""
+        task.status = "cancelled"
+        self._remove_partial_files(task)
         self._notify_progress(task)
         self.save_state()
+
+    def _finish_paused(self, task: DownloadTask):
+        task.status = "paused"
+        self._notify_progress(task)
+
+    def _fail(self, task: DownloadTask, message: str):
+        task.status = "failed"
+        task.error_message = message
+        task.speed_bytes_per_sec = 0
+        self._notify_progress(task)
+        print(f"[ModelDownloader] Download failed ({task.filename}): {message}")
 
     def _create_tqdm_class(self, task):
         import huggingface_hub.utils
@@ -423,168 +484,202 @@ class DownloadManager:
         return CustomTqdm
 
     def _download_worker(self, task: DownloadTask):
-        import traceback
         task.status = "downloading"
+        task.error_message = ""
         task.start_time = time.time()
         task.last_update_time = time.time()
         self._notify_progress(task)
-        
-        parsed_url = urllib.parse.urlparse(task.url)
-        
-        # 1. Check if Hugging Face URL
-        if "huggingface.co" in parsed_url.netloc:
-            import re
-            m = re.search(r"huggingface\.co/([^/]+/[^/]+)/(?:resolve|blob)/([^/]+)/(.*)", task.url)
-            if m:
-                repo_id = m.group(1)
-                revision = m.group(2)
-                filename_in_repo = urllib.parse.unquote(m.group(3))
-                hf_token = config_manager.get_hf_token()
-                
-                import huggingface_hub
-                from huggingface_hub import hf_hub_download
-                from unittest.mock import patch
-                import shutil
-                
-                CustomTqdm = self._create_tqdm_class(task)
-                
-                try:
-                    with patch('huggingface_hub.utils._tqdm.tqdm', CustomTqdm):
-                        target_dir = os.path.dirname(task.temp_path)
-                        hf_temp_dir = os.path.join(target_dir, f".hf_tmp_{task.id}")
-                        os.makedirs(hf_temp_dir, exist_ok=True)
 
-                        try:
-                            cached_path = hf_hub_download(
-                                repo_id=repo_id,
-                                filename=filename_in_repo,
-                                revision=revision,
-                                local_dir=hf_temp_dir,
-                                token=hf_token if hf_token else None
-                            )
-                            # Hub download completed successfully
-                            # Move from the temp dir to the actual temp path (instant on same drive)
-                            shutil.move(cached_path, task.temp_path)
-                            task.downloaded_bytes = os.path.getsize(task.temp_path)
-                            task.total_bytes = task.downloaded_bytes
-                            task.percentage = 100.0
-                            
-                            # Use the same verification and rename logic below
-                            self._finish_success(task)
-                            return
-                        finally:
-                            if os.path.exists(hf_temp_dir):
-                                shutil.rmtree(hf_temp_dir, ignore_errors=True)
-                except ModuleNotFoundError:
-                    task.status = "failed"
-                    task.error_message = "huggingface_hub is not installed. Please restart ComfyUI or run: pip install huggingface-hub"
-                    self._notify_progress(task)
-                    print("[ModelDownloader] Missing huggingface_hub dependency.")
-                    return
-                except KeyboardInterrupt as e:
-                    if task.cancel_requested:
-                        self._finish_cancelled(task)
-                    elif task.is_paused:
-                        task.status = "paused"
-                        self._notify_progress(task)
-                    return
-                except Exception as e:
-                    task.status = "failed"
-                    task.error_message = f"HuggingFace Hub Error: {e}"
-                    self._notify_progress(task)
-                    print(f"[ModelDownloader] HF Download failed: {e}")
-                    return
+        m = HF_URL_RE.search(task.url) if host_matches(urllib.parse.urlparse(task.url).netloc, "huggingface.co") else None
+        if m:
+            self._download_hf(task, m.group(1), m.group(2), urllib.parse.unquote(m.group(3)))
+        else:
+            self._download_http(task)
 
-        # 2. Fallback for Civitai / Others using requests
-        existing_size = 0
-        if os.path.exists(task.temp_path):
-            existing_size = os.path.getsize(task.temp_path)
-        task.downloaded_bytes = existing_size
+    def _download_hf(self, task: DownloadTask, repo_id: str, revision: str, path_in_repo: str):
+        """Downloads through huggingface_hub (handles auth, xet/hf_transfer, and resume)."""
+        try:
+            from huggingface_hub import hf_hub_download
+            from unittest.mock import patch
+            CustomTqdm = self._create_tqdm_class(task)
+        except ModuleNotFoundError:
+            self._fail(task, "huggingface_hub is not installed. Please restart ComfyUI or run: pip install huggingface-hub")
+            return
 
-        headers = {
-            "User-Agent": "ComfyUI-MissingModelDownloader"
-        }
+        hf_token = config_manager.get_hf_token() or None
+        temp_dir = self._hf_temp_dir(task)
+        try:
+            info = hf_client.get_file_info(repo_id, path_in_repo, revision, hf_token)
+            check_disk_space(os.path.dirname(task.temp_path), info.get("size_bytes", 0) - dir_size(temp_dir))
 
-        if host_matches(parsed_url.netloc, "civitai.com"):
+            os.makedirs(temp_dir, exist_ok=True)
+            with patch('huggingface_hub.utils._tqdm.tqdm', CustomTqdm):
+                downloaded_path = hf_hub_download(
+                    repo_id=repo_id,
+                    filename=path_in_repo,
+                    revision=revision,
+                    local_dir=temp_dir,
+                    token=hf_token
+                )
+            # Move out of the temp dir (instant on the same drive), then verify and rename as usual
+            shutil.move(downloaded_path, task.temp_path)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            task.downloaded_bytes = os.path.getsize(task.temp_path)
+            task.total_bytes = task.downloaded_bytes
+            task.percentage = 100.0
+            self._finish_success(task)
+        except KeyboardInterrupt:
+            # Raised from CustomTqdm.update on pause/cancel
+            if task.cancel_requested:
+                self._finish_cancelled(task)
+            elif task.is_paused:
+                self._finish_paused(task)
+        except InsufficientDiskSpace as e:
+            self._fail(task, str(e))
+        except Exception as e:
+            self._remove_partial_files(task)
+            self._fail(task, f"HuggingFace Hub Error: {e}")
+
+    def _download_http(self, task: DownloadTask):
+        """Streams Civitai / direct URLs with Range resume, retrying dropped connections."""
+        import requests
+
+        headers = {"User-Agent": "ComfyUI-MissingModelDownloader"}
+        if host_matches(urllib.parse.urlparse(task.url).netloc, "civitai.com"):
             civitai_token = config_manager.get_civitai_token()
             if civitai_token and "token=" not in task.url:
                 headers["Authorization"] = f"Bearer {civitai_token}"
 
+        retryable = (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+            RetryableHTTPError,
+        )
+        attempt = 0
+        while True:
+            bytes_before = task.downloaded_bytes
+            try:
+                outcome = self._http_attempt(task, headers)
+                if outcome == "done":
+                    self._finish_success(task)
+                elif outcome == "cancelled":
+                    self._finish_cancelled(task)
+                elif outcome == "paused":
+                    self._finish_paused(task)
+                return
+            except InsufficientDiskSpace as e:
+                self._fail(task, str(e))
+                return
+            except retryable as e:
+                if task.downloaded_bytes > bytes_before:
+                    attempt = 0
+                if attempt >= len(HTTP_RETRY_DELAYS):
+                    self._fail(task, f"Network Error: {e}")
+                    return
+                delay = HTTP_RETRY_DELAYS[attempt]
+                attempt += 1
+                print(f"[ModelDownloader] {task.filename}: {e}; retry {attempt}/{len(HTTP_RETRY_DELAYS)} in {delay}s")
+                task.status = "retrying"
+                task.speed_bytes_per_sec = 0
+                task.error_message = f"Connection lost, retrying ({attempt}/{len(HTTP_RETRY_DELAYS)})"
+                self._notify_progress(task)
+                if not self._wait_unless_stopped(task, delay):
+                    return
+                task.status = "downloading"
+                task.error_message = ""
+                self._notify_progress(task)
+            except requests.exceptions.RequestException as e:
+                self._fail(task, f"Network Error: {e}")
+                return
+            except Exception as e:
+                self._fail(task, str(e))
+                return
+
+    def _wait_unless_stopped(self, task: DownloadTask, seconds: float) -> bool:
+        """Sleeps between retries; returns False (after finishing the task) if it was paused or cancelled meanwhile."""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if task.cancel_requested:
+                self._finish_cancelled(task)
+                return False
+            if task.is_paused:
+                self._finish_paused(task)
+                return False
+            time.sleep(0.25)
+        return True
+
+    def _http_attempt(self, task: DownloadTask, base_headers: dict) -> str:
+        """One request, resuming from the partial file. Returns "done", "paused" or "cancelled"."""
+        import requests
+
+        existing_size = os.path.getsize(task.temp_path) if os.path.exists(task.temp_path) else 0
+        task.downloaded_bytes = existing_size
+        headers = dict(base_headers)
         if existing_size > 0:
             headers["Range"] = f"bytes={existing_size}-"
 
-        import requests
-        try:
-            with requests.get(task.url, headers=headers, stream=True, timeout=30) as resp:
-                resp.raise_for_status()
-                
-                status_code = resp.status_code
-                content_length = resp.headers.get("Content-Length")
-                
-                if status_code == 206:
-                    task.total_bytes = existing_size + (int(content_length) if content_length else 0)
-                    write_mode = "ab"
-                else:
-                    task.total_bytes = int(content_length) if content_length else 0
-                    task.downloaded_bytes = 0
-                    write_mode = "wb"
+        with requests.get(task.url, headers=headers, stream=True, timeout=30) as resp:
+            if resp.status_code == 416 and existing_size > 0:
+                # Range starts at/after the end: the partial file already holds the whole download
+                task.total_bytes = existing_size
+                return "done"
+            if resp.status_code >= 500:
+                raise RetryableHTTPError(f"HTTP {resp.status_code} from server")
+            resp.raise_for_status()
 
-                chunk_size = 1024 * 1024
-                speed_window = []
-                last_calc_time = time.time()
-                last_bytes_recorded = task.downloaded_bytes
+            content_length = resp.headers.get("Content-Length")
+            remaining = int(content_length) if content_length and content_length.isdigit() else 0
+            if resp.status_code == 206:
+                task.total_bytes = existing_size + remaining
+                write_mode = "ab"
+            else:
+                # Server ignored the Range header: start over
+                task.total_bytes = remaining
+                task.downloaded_bytes = 0
+                write_mode = "wb"
+            check_disk_space(os.path.dirname(task.temp_path), remaining)
 
-                with open(task.temp_path, write_mode) as f:
-                    for chunk in resp.iter_content(chunk_size=chunk_size):
-                        if task.cancel_requested:
-                            f.close()
-                            self._finish_cancelled(task)
-                            return
-                        if task.is_paused:
-                            f.close()
-                            task.status = "paused"
-                            self._notify_progress(task)
-                            return
+            speed_window = []
+            last_calc_time = time.time()
+            last_bytes_recorded = task.downloaded_bytes
 
-                        if chunk:
-                            f.write(chunk)
-                            task.downloaded_bytes += len(chunk)
+            with open(task.temp_path, write_mode) as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if task.cancel_requested:
+                        return "cancelled"
+                    if task.is_paused:
+                        return "paused"
+                    if not chunk:
+                        continue
 
-                            now = time.time()
-                            time_delta = now - last_calc_time
-                            if time_delta >= 0.5:
-                                bytes_delta = task.downloaded_bytes - last_bytes_recorded
-                                instant_speed = bytes_delta / time_delta
-                                speed_window.append(instant_speed)
-                                if len(speed_window) > 5:
-                                    speed_window.pop(0)
+                    f.write(chunk)
+                    task.downloaded_bytes += len(chunk)
 
-                                task.speed_bytes_per_sec = sum(speed_window) / len(speed_window)
-                                if task.total_bytes > 0:
-                                    task.percentage = (task.downloaded_bytes / task.total_bytes) * 100
-                                    remaining_bytes = max(0, task.total_bytes - task.downloaded_bytes)
-                                    if task.speed_bytes_per_sec > 0:
-                                        task.eta_seconds = remaining_bytes / task.speed_bytes_per_sec
-                                    else:
-                                        task.eta_seconds = 0
+                    now = time.time()
+                    time_delta = now - last_calc_time
+                    if time_delta >= 0.5:
+                        bytes_delta = task.downloaded_bytes - last_bytes_recorded
+                        speed_window.append(bytes_delta / time_delta)
+                        if len(speed_window) > 5:
+                            speed_window.pop(0)
 
-                                last_calc_time = now
-                                last_bytes_recorded = task.downloaded_bytes
-                                self._notify_progress(task)
-            
-            # Successfully downloaded all chunks
-            self._finish_success(task)
+                        task.speed_bytes_per_sec = sum(speed_window) / len(speed_window)
+                        if task.total_bytes > 0:
+                            task.percentage = (task.downloaded_bytes / task.total_bytes) * 100
+                            remaining_bytes = max(0, task.total_bytes - task.downloaded_bytes)
+                            task.eta_seconds = remaining_bytes / task.speed_bytes_per_sec if task.speed_bytes_per_sec > 0 else 0
 
-        except requests.exceptions.RequestException as e:
-            task.status = "failed"
-            task.error_message = f"Network Error: {e}"
-            self._notify_progress(task)
-            print(f"[ModelDownloader] Request failed: {e}")
-        except Exception as e:
-            task.status = "failed"
-            task.error_message = str(e)
-            self._notify_progress(task)
-            print(f"[ModelDownloader] Download exception: {e}")
+                        last_calc_time = now
+                        last_bytes_recorded = task.downloaded_bytes
+                        self._notify_progress(task)
+
+        # A clean end of stream that's shorter than advertised is a dropped connection, not success
+        if task.total_bytes > 0 and task.downloaded_bytes < task.total_bytes:
+            raise requests.exceptions.ChunkedEncodingError(
+                f"Connection closed early ({task.downloaded_bytes} of {task.total_bytes} bytes)"
+            )
+        return "done"
 
     def _finish_success(self, task: DownloadTask):
         # Verification
@@ -595,7 +690,7 @@ class DownloadManager:
             sha256_hash = hashlib.sha256()
             try:
                 with open(task.temp_path, "rb") as f:
-                    for byte_block in iter(lambda: f.read(4096), b""):
+                    for byte_block in iter(lambda: f.read(1024 * 1024), b""):
                         sha256_hash.update(byte_block)
                 actual_sha256 = sha256_hash.hexdigest().lower()
                 if actual_sha256 != task.expected_sha256.lower():

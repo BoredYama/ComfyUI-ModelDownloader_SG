@@ -5,6 +5,8 @@ __pycache__/
 *.so
 .env
 config.json
+downloads.json
 *.downloading
 .vscode/
 .idea/
+CLAUDE.md

@@ -185,17 +185,19 @@ try:
             url = data.get("url", "").strip()
             filename = data.get("filename", "").strip()
             folder_type = data.get("folder_type", "checkpoints").strip()
-            target_dir = data.get("target_dir", "").strip()
+            subfolder = (data.get("subfolder") or "").strip()
             overwrite = bool(data.get("overwrite", False))
-            expected_sha256 = data.get("sha256", "").strip()
+            expected_sha256 = (data.get("sha256") or "").strip()
 
             if not url or not filename:
                 return web.json_response({"status": "error", "message": "Missing url or filename"}, status=400)
 
-            if not target_dir:
-                target_dir = detector.get_target_directory(folder_type)
+            # The destination always comes from the folder type (validated by the detector); a client-supplied
+            # directory is never trusted, so downloads can only land in model folders.
+            target_dir = detector.get_target_directory(folder_type)
 
-            task_id = download_manager.start_download(url, filename, target_dir, folder_type, overwrite=overwrite, expected_sha256=expected_sha256)
+            task_id = download_manager.start_download(url, filename, target_dir, folder_type, overwrite=overwrite,
+                                                      expected_sha256=expected_sha256, subfolder=subfolder)
             return web.json_response({
                 "status": "success",
                 "task_id": task_id,
